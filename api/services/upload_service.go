@@ -85,7 +85,8 @@ func SaveUpload(cfg *config.Config, fh *multipart.FileHeader) (string, string, e
 }
 
 // ImportPNGSet 把用户上传的多张 PNG 按提交顺序组装成一个"图层集"目录
-// （output/png_import_<ts>/），供分层工作台预览与 Live2D 导出直接使用。
+// （output/png_import_<随机名>/，命名抗并发碰撞），供分层工作台预览与
+// Live2D 导出直接使用。
 // 所有图层统一规范到最大画布尺寸（左上对齐）—— Live2D 网格要求各层
 // 共享同一画布，异尺寸直接导出会被 moc3 构建器以"画布尺寸不一致"拒绝。
 // 返回目录路径与有序图层信息。
@@ -115,7 +116,7 @@ func ImportPNGSet(cfg *config.Config, files []*multipart.FileHeader) (string, []
 		return "", nil, fmt.Errorf("批量导入总量超出限制（累计最多 500MB，当前约 %dMB）",
 			totalBytes>>20)
 	}
-	dir := filepath.Join(cfg.Output.BaseDir, fmt.Sprintf("png_import_%d", time.Now().Unix()))
+	dir := filepath.Join(cfg.Output.BaseDir, uniqueOutputName("png_import_"))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", nil, fmt.Errorf("创建导入目录失败: %v", err)
 	}

@@ -267,7 +267,7 @@ func (pb *PythonBridge) CreatePSDPlan(ctx context.Context, imagePath string) (*m
 		return nil, fmt.Errorf("图片不存在: %s", imagePath)
 	}
 
-	outputDir := filepath.Join(pb.cfg.Output.BaseDir, fmt.Sprintf("psd_plan_%d", time.Now().Unix()))
+	outputDir := filepath.Join(pb.cfg.Output.BaseDir, uniqueOutputName("psd_plan_"))
 	os.MkdirAll(outputDir, 0755)
 
 	// Run KMeans layerer + PSD creator inline via Python
@@ -485,7 +485,7 @@ func (pb *PythonBridge) SegmentImage(ctx context.Context, imagePath, method stri
 	if method != "kmeans" {
 		method = "semantic"
 	}
-	outDir := filepath.Join(pb.cfg.Output.BaseDir, fmt.Sprintf("layers_%d", time.Now().Unix()))
+	outDir := filepath.Join(pb.cfg.Output.BaseDir, uniqueOutputName("layers_"))
 	// 语义分割在 CPU 上可能耗时数分钟，预算给足
 	res, err := pb.runBridgeTask(ctx, bridgeSegmentScript, map[string]interface{}{
 		"image_path": imagePath,
@@ -598,7 +598,7 @@ func (pb *PythonBridge) ImportPSDLayers(ctx context.Context, psdPath string) (ma
 	if _, err := os.Stat(psdPath); err != nil {
 		return nil, fmt.Errorf("PSD 文件不存在: %s", psdPath)
 	}
-	outDir := filepath.Join(pb.cfg.Output.BaseDir, fmt.Sprintf("psd_import_%d", time.Now().Unix()))
+	outDir := filepath.Join(pb.cfg.Output.BaseDir, uniqueOutputName("psd_import_"))
 	// psd-tools 逐层导出在超大 PSD 上可能较慢，预算给足
 	res, err := pb.runBridgeTask(ctx, bridgeImportPSDScript, map[string]interface{}{
 		"psd_path": psdPath,

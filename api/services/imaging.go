@@ -1,6 +1,8 @@
 package services
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"image"
 	"image/draw"
@@ -8,6 +10,8 @@ import (
 	"image/png"
 	"io"
 	"os"
+	"sync/atomic"
+	"time"
 )
 
 // 本包所有图像处理均基于 Go 标准库（image/png、image/jpeg、image/draw），
@@ -56,6 +60,32 @@ func rejectOversizedImageConfig(r io.Reader) error {
 		)
 	}
 	return nil
+}
+
+// uniqueNameSeq 仅在 crypto/rand 失败的兜底路径上使用：单调计数器保证
+// 同一纳秒内的并发调用也不会产出同名目录。
+var uniqueNameSeq atomic.Uint64
+
+// fallbackOutputName 是熵源故障时的兜底命名：纳秒时间戳 + 进程内单调序号。
+// 绝不能退化成「PID + 固定字节」这种进程内恒定值——那样每次调用都同名，
+// 碰撞防护形同虚设。
+func fallbackOutputName(prefix string) string {
+	return fmt.Sprintf("%s%d-%08x", prefix, time.Now().UnixNano(), uniqueNameSeq.Add(1))
+}
+
+// uniqueOutputName 生成「前缀 + 12 位随机 hex」的产物名，如 layers_1a2b3c4d5e6f。
+//
+// 秒级时间戳在并发请求落同一秒时会生成同名目录：两个分层/导入任务互相覆盖
+// 图层文件、共享 PSD 产物（与 Python 侧 M6 同类问题）。crypto/rand 无需
+// 引入依赖，碰撞概率可忽略；命名仍保留可读前缀，不影响 layers_* 等 glob。
+func uniqueOutputName(prefix string) string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// rand 失败极罕见（等于系统熵源故障）；用纳秒时间戳 + 单调计数器
+		// 保证进程内唯一，且名称形态（前缀 + 十六进制串）与随机路径一致。
+		return fallbackOutputName(prefix)
+	}
+	return prefix + hex.EncodeToString(b[:])
 }
 
 // NormalizeToCanvas 把 src 绘制到 maxW×maxH 的透明 RGBA 画布上
