@@ -2,7 +2,6 @@ package services
 
 import (
 	"fmt"
-	"image"
 	"io"
 	"mime/multipart"
 	"os"
@@ -121,61 +120,68 @@ func ImportPNGSet(cfg *config.Config, files []*multipart.FileHeader) (string, []
 		return "", nil, fmt.Errorf("创建导入目录失败: %v", err)
 	}
 
-	// 先整体解码，拿到最大画布
-	type decoded struct {
-		img  image.Image
+	// 两遍扫描策略（防内存放大）：
+	//   第一遍：只读文件头拿最大画布尺寸（image.DecodeConfig，不解码像素），
+	//           同时保存每个文件的元信息（名称、尺寸）供第二遍使用；
+	//   第二遍：逐张完整解码→规范化→写盘→释放，任一时刻内存中只有一张解码图。
+	//
+	// 旧实现把全部文件解码后存入 decodedFiles 切片，200 张 4K PNG 的峰值内存
+	// 可达 ~6.6GB，极易 OOM。两遍扫描把峰值降到 O(单张图)。
+
+	// ---- 第一遍：只读 header，拿最大画布 + 元信息 ----
+	type fileMeta struct {
 		name string
 		base string
-		ext  string
+		w, h int
 	}
-	decodedFiles := make([]decoded, 0, len(files))
+	metas := make([]fileMeta, len(files))
 	maxW, maxH := 0, 0
-	for _, fh := range files {
+	for i, fh := range files {
 		src, err := fh.Open()
 		if err != nil {
 			return "", nil, fmt.Errorf("读取上传文件失败: %v", err)
 		}
-		// 先只解析文件头做像素边界检查（防解压炸弹），通过后回到流首完整解码。
-		if err := rejectOversizedImageConfig(src); err != nil {
-			src.Close()
+		cfg, err := checkImageConfig(src)
+		src.Close()
+		if err != nil {
 			return "", nil, fmt.Errorf("文件 %s 无法导入: %v", fh.Filename, err)
 		}
-		if _, err := src.Seek(0, io.SeekStart); err != nil {
-			src.Close()
-			return "", nil, fmt.Errorf("文件 %s 读取失败: %v", fh.Filename, err)
+		if cfg.Width > maxW {
+			maxW = cfg.Width
+		}
+		if cfg.Height > maxH {
+			maxH = cfg.Height
+		}
+		metas[i] = fileMeta{
+			name: strings.TrimSuffix(fh.Filename, filepath.Ext(fh.Filename)),
+			base: sanitizeUploadName(strings.TrimSuffix(filepath.Base(fh.Filename), filepath.Ext(fh.Filename))),
+			w:    cfg.Width,
+			h:    cfg.Height,
+		}
+	}
+
+	// ---- 第二遍：逐张解码→规范化→写盘（内存中同时只有一张图）----
+	layers := make([]map[string]interface{}, 0, len(metas))
+	for i, fh := range files {
+		src, err := fh.Open()
+		if err != nil {
+			return "", nil, fmt.Errorf("读取上传文件失败: %v", err)
 		}
 		img, err := decodeImageReader(src)
 		src.Close()
 		if err != nil {
 			return "", nil, fmt.Errorf("文件 %s 无法解码为图片: %v", fh.Filename, err)
 		}
-		b := img.Bounds()
-		if b.Dx() > maxW {
-			maxW = b.Dx()
-		}
-		if b.Dy() > maxH {
-			maxH = b.Dy()
-		}
-		decodedFiles = append(decodedFiles, decoded{
-			img:  img,
-			name: strings.TrimSuffix(fh.Filename, filepath.Ext(fh.Filename)),
-			base: sanitizeUploadName(strings.TrimSuffix(filepath.Base(fh.Filename), filepath.Ext(fh.Filename))),
-			ext:  strings.ToLower(filepath.Ext(fh.Filename)),
-		})
-	}
-
-	layers := make([]map[string]interface{}, 0, len(decodedFiles))
-	for i, df := range decodedFiles {
-		dest := filepath.Join(dir, fmt.Sprintf("%03d_%s.png", i, df.base))
-		// 规范化到统一画布（左上对齐，透明补边）
-		if err := NormalizeToCanvas(df.img, maxW, maxH, dest); err != nil {
-			return "", nil, fmt.Errorf("图层 %s 规范化失败: %v", df.name, err)
+		dest := filepath.Join(dir, fmt.Sprintf("%03d_%s.png", i, metas[i].base))
+		if err := NormalizeToCanvas(img, maxW, maxH, dest); err != nil {
+			return "", nil, fmt.Errorf("图层 %s 规范化失败: %v", metas[i].name, err)
 		}
 		layers = append(layers, map[string]interface{}{
-			"name":  df.name,
+			"name":  metas[i].name,
 			"path":  dest,
 			"order": i,
 		})
+		// img 在下一次迭代时自然被 GC 回收
 	}
 	return dir, layers, nil
 }

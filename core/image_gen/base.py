@@ -9,6 +9,7 @@ automatically discovers and routes to registered providers.
 import abc
 import ipaddress
 import socket
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,59 @@ class GenerationResult:
 MAX_IMAGE_DOWNLOAD_BYTES = 50 << 20
 
 
+# ---------- DNS pin：关闭 CheckedURL.parse 与 requests.get 之间的 TOCTOU 窗口 ----------
+#
+# 攻击向量（DNS rebinding）：CheckedURL.parse 在校验阶段解析 DNS 并验证 IP 是
+# 公网地址，随后 requests.get 再次解析 DNS 连接。两次解析之间攻击者可改变
+# DNS 记录指向内网/云元数据地址，绕过第一阶段的边界校验。
+#
+# 防御：parse 阶段缓存已验证的 addr_infos，连接阶段经 DNSPin 上下文管理器
+# 把同一组 addr_infos 重新喂给 socket.getaddrinfo，使两次解析返回同一结果。
+# 使用 threading.local 保证线程安全——只有显式进入 DNSPin 的线程受影响。
+
+_dns_local = threading.local()
+_original_getaddrinfo = socket.getaddrinfo
+
+
+def _pinned_getaddrinfo(host, port, *args, **kwargs):
+    """DNS 解调解器：若当前线程对 host 设置了 pin，返回 pin 的缓存结果。"""
+    pins = getattr(_dns_local, "pins", None)
+    if pins and host in pins:
+        return pins[host]
+    return _original_getaddrinfo(host, port, *args, **kwargs)
+
+
+# 安装调解器（进程级替换，但对未 pin 的线程完全透明）
+socket.getaddrinfo = _pinned_getaddrinfo
+
+
+class DNSPin:
+    """线程局部 DNS pin 上下文管理器。
+
+    with DNSPin(host, addr_infos):
+        requests.get(url, ...)
+    # 连接阶段使用 parse 阶段验证过的 IP，攻击者无法在两次解析间做 rebinding。
+    """
+
+    __slots__ = ("_host", "_addr_infos")
+
+    def __init__(self, host: str, addr_infos: list):
+        self._host = host
+        self._addr_infos = addr_infos
+
+    def __enter__(self):
+        if not hasattr(_dns_local, "pins"):
+            _dns_local.pins = {}
+        _dns_local.pins[self._host] = self._addr_infos
+        return self
+
+    def __exit__(self, *exc):
+        pins = getattr(_dns_local, "pins", None)
+        if pins:
+            pins.pop(self._host, None)
+        return False
+
+
 class CheckedURL:
     """经过协议与解析 IP 边界校验的出站 URL（防 SSRF）。
 
@@ -60,11 +114,12 @@ class CheckedURL:
     rebinding 到内网/云元数据服务）。
     """
 
-    __slots__ = ("url", "host")
+    __slots__ = ("url", "host", "addr_infos")
 
-    def __init__(self, url: str, host: str):
+    def __init__(self, url: str, host: str, addr_infos: list = None):
         self.url = url
         self.host = host
+        self.addr_infos = addr_infos
 
     @classmethod
     def parse(cls, raw: str, trusted_hosts: FrozenSet[str]) -> "CheckedURL":
@@ -98,7 +153,7 @@ class CheckedURL:
                 raise GenerationError(f"出站 URL 解析出非法地址: {host}") from e
             if not ip.is_global:
                 raise GenerationError("出站 URL 解析到非公网地址，已拒绝")
-        return cls(raw, host)
+        return cls(raw, host, infos)
 
 
 def read_bounded(resp: "requests.Response", max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> bytes:
@@ -122,12 +177,17 @@ def checked_image_download(
     """下载上游返回的图片 URL 的唯一安全出口。
 
     - URL 经 CheckedURL 校验（协议白名单 + 公网 IP 边界）；
+    - DNS pin：连接阶段复用 parse 阶段验证过的 IP（防 DNS rebinding TOCTOU）；
     - 禁止自动重定向（302 到内网/元数据地址直接抛错，不跟随）；
     - 响应体流式读取并受 max_bytes 限制。
     """
     checked = CheckedURL.parse(raw_url, trusted_hosts)
     try:
-        resp = requests.get(checked.url, timeout=timeout, stream=True, allow_redirects=False)
+        if checked.addr_infos:
+            with DNSPin(checked.host, checked.addr_infos):
+                resp = requests.get(checked.url, timeout=timeout, stream=True, allow_redirects=False)
+        else:
+            resp = requests.get(checked.url, timeout=timeout, stream=True, allow_redirects=False)
     except requests.RequestException as e:
         raise GenerationError(f"下载生成图像失败: {e}") from e
     try:

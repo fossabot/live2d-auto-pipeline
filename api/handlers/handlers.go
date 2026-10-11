@@ -375,8 +375,19 @@ func (h *Handler) ServeOutput(c *gin.Context) {
 		return
 	}
 
-	// 检查文件是否存在
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+	// 检查文件是否存在 & 拒绝目录请求（防目录列举泄露产物清单）
+	info, err := os.Stat(filePath)
+	if err != nil {
+		c.JSON(http.StatusNotFound, models.Response{
+			Success: false,
+			Error:   "文件不存在",
+		})
+		return
+	}
+	if info.IsDir() {
+		// gin 的 c.File 对目录会返回 http.ServeFile 的 HTML 目录列举，
+		// 泄露 output 下全部产物（生成的图片、分层目录、导出模型等）。
+		// 面捕/预览只需具体文件，目录一律按「不存在」处理。
 		c.JSON(http.StatusNotFound, models.Response{
 			Success: false,
 			Error:   "文件不存在",

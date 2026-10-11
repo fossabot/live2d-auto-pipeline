@@ -113,16 +113,8 @@ func main() {
 		c.Next()
 	})
 
-	// 安全响应头中间件
-	r.Use(func(c *gin.Context) {
-		c.Header("X-Content-Type-Options", "nosniff")
-		c.Header("X-Frame-Options", "DENY")
-		c.Header("X-XSS-Protection", "1; mode=block")
-		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
-		c.Header("Content-Security-Policy", "default-src 'self'")
-		c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		c.Next()
-	})
+	// 安全响应头中间件（提取为具名函数以便测试覆盖）
+	r.Use(securityHeadersMiddleware())
 
 	// 输入验证中间件 - 防止恶意请求
 	r.Use(validateRequestMiddleware())
@@ -484,6 +476,44 @@ func allowedHostMiddleware(allowed map[string]struct{}) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "非法的 Host 来源"})
 			return
 		}
+		c.Next()
+	}
+}
+
+// securityCSP 是桌面/内嵌 UI 的内容安全策略。
+//
+// 面捕（MediaPipe FaceLandmarker WASM）的资源需求：
+//   - script-src 'unsafe-eval'：WASM 运行时与 vision_wasm_internal.js 的动态求值；
+//   - connect-src 放行 jsdelivr（WASM CDN 回退）与 googleapis（模型 CDN 回退）：
+//     本地 vendor 缺失时浏览器端面捕不会全功能失效；
+//   - img-src/media-src blob:：摄像头帧经 createObjectURL 后是 blob: URL；
+//   - frame-ancestors 'none'：防嵌入（与 _headers 部署侧保持一致）。
+const securityCSP = "default-src 'self'; " +
+	"script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
+	"style-src 'self' 'unsafe-inline'; " +
+	"img-src 'self' data: blob:; " +
+	"media-src 'self' blob:; " +
+	"connect-src 'self' https://cdn.jsdelivr.net https://storage.googleapis.com; " +
+	"font-src 'self'; " +
+	"frame-ancestors 'none'; " +
+	"base-uri 'self'"
+
+// securityPermissionsPolicy 锁定浏览器端能力面。
+//
+// camera=(self) 允许同源页面使用 getUserMedia —— 面捕必须；
+// 麦克风与地理位置保持关闭。
+const securityPermissionsPolicy = "camera=(self), microphone=(), geolocation=()"
+
+// securityHeadersMiddleware 设置统一安全响应头（桌面版与内嵌 UI 共用）。
+func securityHeadersMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("X-XSS-Protection", "1; mode=block")
+		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Header("Content-Security-Policy", securityCSP)
+		c.Header("Permissions-Policy", securityPermissionsPolicy)
+		c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		c.Next()
 	}
 }

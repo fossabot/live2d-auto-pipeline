@@ -42,24 +42,30 @@ func decodeImageReader(r io.Reader) (image.Image, error) {
 	return img, nil
 }
 
-// rejectOversizedImageConfig 只解析文件头（不解码像素、不按解压后尺寸
-// 分配内存）就校验画布边界。标准库 image/png 没有像素总量保护，一张 ≤25MB
+// checkImageConfig 只解析文件头（不解码像素、不按解压后尺寸分配内存）
+// 就校验画布边界并返回尺寸。标准库 image/png 没有像素总量保护，一张 ≤25MB
 // 的 PNG 可声明数万边长（解压后数十 GB），必须在完整解码前拒绝，防 OOM。
-func rejectOversizedImageConfig(r io.Reader) error {
+func checkImageConfig(r io.Reader) (image.Config, error) {
 	cfg, _, err := image.DecodeConfig(r)
 	if err != nil {
-		return err
+		return image.Config{}, err
 	}
 	if cfg.Width <= 0 || cfg.Height <= 0 {
-		return fmt.Errorf("图片尺寸非法（%dx%d）", cfg.Width, cfg.Height)
+		return image.Config{}, fmt.Errorf("图片尺寸非法（%dx%d）", cfg.Width, cfg.Height)
 	}
 	if cfg.Width > maxImageDimension || cfg.Height > maxImageDimension {
-		return fmt.Errorf(
+		return image.Config{}, fmt.Errorf(
 			"图片尺寸 %dx%d 超出像素上限（单边最大 %d），疑似解压炸弹",
 			cfg.Width, cfg.Height, maxImageDimension,
 		)
 	}
-	return nil
+	return cfg, nil
+}
+
+// rejectOversizedImageConfig 是 checkImageConfig 的纯校验包装（兼容既有调用方）。
+func rejectOversizedImageConfig(r io.Reader) error {
+	_, err := checkImageConfig(r)
+	return err
 }
 
 // uniqueNameSeq 仅在 crypto/rand 失败的兜底路径上使用：单调计数器保证

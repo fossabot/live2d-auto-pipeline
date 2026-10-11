@@ -8,6 +8,7 @@
 """
 
 import http.server
+import socket
 import socketserver
 import threading
 
@@ -138,3 +139,62 @@ def test_seedream_and_sensenova_route_download_through_guard(monkeypatch):
 
     # 直接验证模块符号存在且来自共享护栏
     assert seedream.checked_image_download is sensenova.checked_image_download
+
+
+# ---------- P4-B: DNS rebinding TOCTOU 收口 ----------
+def test_checked_url_caches_addr_infos_for_hostname(monkeypatch):
+    """主机名 URL 应缓存解析结果（addr_infos 非 None），供 DNSPin 连接复用。"""
+    from core.image_gen import base as _base
+
+    monkeypatch.setattr(
+        _base, "_original_getaddrinfo",
+        lambda host, *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))],
+    )
+    u = CheckedURL.parse("https://example.com/x.png", frozenset())
+    assert u.addr_infos is not None
+    assert len(u.addr_infos) > 0
+
+
+def test_checked_url_no_addr_infos_for_literal_ip():
+    """字面量 IP 不经过 DNS，无需 pin。"""
+    u = CheckedURL.parse("http://8.8.8.8/x.png", frozenset())
+    assert u.addr_infos is None
+
+
+def test_checked_url_no_addr_infos_for_trusted_host():
+    """可信主机直接放行，不缓存 DNS 结果。"""
+    u = CheckedURL.parse(
+        "http://127.0.0.1:8080/internal/a.png", frozenset({"127.0.0.1"})
+    )
+    assert u.addr_infos is None
+
+
+def test_dns_pin_returns_cached_resolution():
+    """DNSPin 上下文内 socket.getaddrinfo 返回 pin 的结果，不受外部 DNS 变化影响。"""
+    from core.image_gen.base import DNSPin
+
+    fake_infos = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0)),
+    ]
+    with DNSPin("test-pin-host.example", fake_infos):
+        result = socket.getaddrinfo("test-pin-host.example", None)
+    assert result is fake_infos
+
+
+def test_dns_pin_does_not_affect_unpinned_hosts(monkeypatch):
+    """DNSPin 只影响被 pin 的 host，其他 host 走正常解析。"""
+    from core.image_gen.base import DNSPin
+
+    def fake_original(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("5.6.7.8", 0))]
+
+    monkeypatch.setattr("core.image_gen.base._original_getaddrinfo", fake_original)
+
+    fake_infos = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 0))]
+    with DNSPin("pinned-host.example", fake_infos):
+        # pinned host 返回 pin 的结果
+        assert socket.getaddrinfo("pinned-host.example", None) is fake_infos
+        # 另一个 host 不应被 pin，走原始解析（已被 mock 为 5.6.7.8）
+        result = socket.getaddrinfo("other-host.example", None)
+        assert result is not fake_infos
+        assert result[0][4][0] == "5.6.7.8"
