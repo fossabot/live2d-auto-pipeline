@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -170,10 +171,7 @@ func (h *Handler) GenerateImage(c *gin.Context) {
 		var err error
 		result, err = h.imageGenerator.GenerateImage(req)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.Response{
-				Success: false,
-				Error:   "图片生成失败: " + err.Error(),
-			})
+			h.serverError(c, "图片生成", err)
 			return
 		}
 
@@ -230,8 +228,14 @@ func (h *Handler) GenerateCharacter(c *gin.Context) {
 	h.wsHub.BroadcastProgress(taskID, "generating", 40, "正在生成图片...")
 	result, err := h.imageGenerator.GenerateWithCharacter(req)
 	if err != nil {
-		h.wsHub.BroadcastProgress(taskID, "error", 0, err.Error())
-		c.JSON(http.StatusInternalServerError, models.Response{Success: false, Error: "生成失败: " + err.Error()})
+		// 异常详情只进日志；推给浏览器/返回给客户端的是固定文案，
+		// 避免上游错误原文（可能含内部 URL/路径）经 WS 或 HTTP 外泄。
+		log.Printf("[error] 角色生成: %v", err)
+		h.wsHub.BroadcastProgress(taskID, "error", 0, "生成服务暂不可用，请稍后重试")
+		c.JSON(http.StatusInternalServerError, models.Response{
+			Success: false,
+			Error:   "角色生成服务暂不可用，请稍后重试",
+		})
 		return
 	}
 	h.wsHub.BroadcastProgress(taskID, "done", 100, "生成完成！")
@@ -248,7 +252,7 @@ func (h *Handler) Chat(c *gin.Context) {
 	}
 	resp, err := h.chatSvc.Chat(req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.Response{Success: false, Error: "聊天失败: " + err.Error()})
+		h.serverError(c, "聊天", err)
 		return
 	}
 	c.JSON(http.StatusOK, models.Response{Success: true, Data: resp})
@@ -284,10 +288,7 @@ func (h *Handler) CreatePSDPlan(c *gin.Context) {
 			})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, models.Response{
-			Success: false,
-			Error:   "PSD分层失败: " + err.Error(),
-		})
+		h.serverError(c, "PSD分层", err)
 		return
 	}
 
@@ -311,10 +312,7 @@ func (h *Handler) RunSeeThrough(c *gin.Context) {
 
 	result, err := h.pythonBridge.RunSeeThroughWorkflow(req.ImagePath)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.Response{
-			Success: false,
-			Error:   "See-through 工作流启动失败: " + err.Error(),
-		})
+		h.serverError(c, "See-through 工作流", err)
 		return
 	}
 
@@ -331,6 +329,17 @@ func (h *Handler) GetPythonScripts(c *gin.Context) {
 	c.JSON(http.StatusOK, models.Response{
 		Success: true,
 		Data:    scripts,
+	})
+}
+
+// serverError 用于未预期的服务端错误（5xx）：异常详情（可能含绝对路径、
+// 上游错误原文等内部信息）只写服务端日志，响应体统一返回固定文案，
+// 不向前端/局域网客户端泄露实现细节。业务校验失败（400/404）不要用它。
+func (h *Handler) serverError(c *gin.Context, where string, err error) {
+	log.Printf("[error] %s: %v", where, err)
+	c.JSON(http.StatusInternalServerError, models.Response{
+		Success: false,
+		Error:   where + "服务暂不可用，请稍后重试",
 	})
 }
 
@@ -458,14 +467,16 @@ func (h *Handler) SegmentImage(c *gin.Context) {
 
 	result, err := h.pythonBridge.SegmentImage(imagePath, req.Method)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, services.ErrPythonTimeout) {
-			status = http.StatusGatewayTimeout
+		switch {
+		case errors.Is(err, services.ErrPathOutsideBase):
+			// 业务校验：文案不含路径细节，可直接回传
+			c.JSON(http.StatusBadRequest, models.Response{Success: false, Error: err.Error()})
+		case errors.Is(err, services.ErrPythonTimeout):
+			// 超时：文案只含预算提示，不含路径，保持既有 504 契约
+			c.JSON(http.StatusGatewayTimeout, models.Response{Success: false, Error: err.Error()})
+		default:
+			h.serverError(c, "图像分层", err)
 		}
-		if errors.Is(err, services.ErrPathOutsideBase) {
-			status = http.StatusBadRequest
-		}
-		c.JSON(status, models.Response{Success: false, Error: err.Error()})
 		return
 	}
 
@@ -519,7 +530,7 @@ func (h *Handler) AddCharacterReference(c *gin.Context) {
 
 	card, err := h.charSvc.UpdateReference(characterID, req.View, req.ImagePath)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.Response{Success: false, Error: err.Error()})
+		h.serverError(c, "登记参考图", err)
 		return
 	}
 	// embedding 提取尽力而为：失败时参考图路径已在卡上，前端可稍后重算
@@ -540,11 +551,11 @@ func (h *Handler) RecomputeCharacterEmbedding(c *gin.Context) {
 	}
 	result, err := h.pythonBridge.RecomputeCharacterEmbedding(characterID)
 	if err != nil {
-		status := http.StatusInternalServerError
 		if errors.Is(err, services.ErrPythonTimeout) {
-			status = http.StatusGatewayTimeout
+			c.JSON(http.StatusGatewayTimeout, models.Response{Success: false, Error: err.Error()})
+			return
 		}
-		c.JSON(status, models.Response{Success: false, Error: err.Error()})
+		h.serverError(c, "embedding 重算", err)
 		return
 	}
 	c.JSON(http.StatusOK, models.Response{Success: true, Message: "embedding 已更新", Data: result})
@@ -559,10 +570,12 @@ func (h *Handler) RecomputeCharacterEmbedding(c *gin.Context) {
 func (h *Handler) ListImageProviders(c *gin.Context) {
 	available, registered, err := h.pythonBridge.ListImageProviders()
 	if err != nil {
-		// 查询失败不阻塞前端：如实报告错误并附空列表
+		// 查询失败不阻塞前端：给前端固定的业务状态，错误详情（可能含本机
+		// 路径/上游原文）只记日志，不随响应体下发。
+		log.Printf("[error] 上游状态查询: %v", err)
 		c.JSON(http.StatusOK, models.Response{
 			Success: true,
-			Message: "上游状态查询失败：" + err.Error(),
+			Message: "上游状态暂不可用",
 			Data:    map[string]interface{}{"available": []map[string]interface{}{}, "registered": []string{}, "query_ok": false},
 		})
 		return
@@ -608,11 +621,11 @@ func (h *Handler) ImportPSD(c *gin.Context) {
 	}
 	result, err := h.pythonBridge.ImportPSDLayers(path)
 	if err != nil {
-		status := http.StatusInternalServerError
 		if errors.Is(err, services.ErrPythonTimeout) {
-			status = http.StatusGatewayTimeout
+			c.JSON(http.StatusGatewayTimeout, models.Response{Success: false, Error: err.Error()})
+			return
 		}
-		c.JSON(status, models.Response{Success: false, Error: err.Error()})
+		h.serverError(c, "PSD 图层导入", err)
 		return
 	}
 	layers, _ := result["layers"].([]interface{})
@@ -744,7 +757,7 @@ func (h *Handler) ClearCache(c *gin.Context) {
 func (h *Handler) ListCharacters(c *gin.Context) {
 	chars, err := h.charSvc.ListCharacters()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.Response{Success: false, Error: err.Error()})
+		h.serverError(c, "角色列表读取", err)
 		return
 	}
 	c.JSON(http.StatusOK, models.Response{Success: true, Data: chars})
@@ -759,7 +772,7 @@ func (h *Handler) CreateCharacter(c *gin.Context) {
 	}
 	card, err := h.charSvc.CreateCharacter(req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.Response{Success: false, Error: err.Error()})
+		h.serverError(c, "角色创建", err)
 		return
 	}
 	c.JSON(http.StatusCreated, models.Response{Success: true, Message: "角色创建成功", Data: card})
@@ -786,7 +799,7 @@ func (h *Handler) UpdateCharacter(c *gin.Context) {
 	}
 	card, err := h.charSvc.UpdateCharacter(id, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.Response{Success: false, Error: err.Error()})
+		h.serverError(c, "角色更新", err)
 		return
 	}
 	c.JSON(http.StatusOK, models.Response{Success: true, Message: "角色已更新", Data: card})
@@ -796,7 +809,7 @@ func (h *Handler) UpdateCharacter(c *gin.Context) {
 func (h *Handler) DeleteCharacter(c *gin.Context) {
 	id := c.Param("id")
 	if err := h.charSvc.DeleteCharacter(id); err != nil {
-		c.JSON(http.StatusInternalServerError, models.Response{Success: false, Error: err.Error()})
+		h.serverError(c, "角色删除", err)
 		return
 	}
 	c.JSON(http.StatusOK, models.Response{Success: true, Message: "角色已删除"})
@@ -835,7 +848,9 @@ func (h *Handler) ChatStream(c *gin.Context) {
 	})
 
 	if err != nil {
-		errChunk := services.ChatStreamChunk{Type: "error", Error: err.Error()}
+		// 流已开始无法改状态码：异常详情只进日志，推给浏览器固定文案。
+		log.Printf("[error] 流式聊天: %v", err)
+		errChunk := services.ChatStreamChunk{Type: "error", Error: "聊天服务暂不可用，请稍后重试"}
 		data, _ := json.Marshal(errChunk)
 		c.Writer.Write([]byte("data: " + string(data) + "\n\n"))
 		flusher.Flush()
@@ -877,8 +892,11 @@ func (h *Handler) exportFailureResponse(c *gin.Context, err error) {
 		})
 		return
 	}
+	// 默认 500：导出构建错误原文可能含临时目录/内部路径，只记日志，
+	// 客户端拿固定文案（504 超时分支在上面保留含预算的业务提示）。
+	log.Printf("[error] Live2D 导出: %v", err)
 	c.JSON(http.StatusInternalServerError, models.Response{
-		Success: false, Error: err.Error(),
+		Success: false, Error: "导出服务暂不可用，请稍后重试",
 	})
 }
 
@@ -915,7 +933,7 @@ func (h *Handler) ExportLive2D(c *gin.Context) {
 		}
 		zipBytes, err := zipDirectory(modelDir)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.Response{Success: false, Error: "打包失败: " + err.Error()})
+			h.serverError(c, "模型打包", err)
 			return
 		}
 		if len(zipBytes) == 0 {
@@ -1062,8 +1080,7 @@ func (h *Handler) ExportPSD(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, models.Response{Success: false, Error: err.Error()})
 			return
 		}
-		// Fail-open: return a structured error rather than crashing.
-		c.JSON(http.StatusInternalServerError, models.Response{Success: false, Error: "PSD导出失败: " + err.Error()})
+		h.serverError(c, "PSD导出", err)
 		return
 	}
 	c.JSON(http.StatusOK, models.Response{Success: true, Message: "PSD导出成功", Data: result})

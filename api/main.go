@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"runtime"
@@ -39,12 +40,26 @@ func main() {
 		log.Fatalf("加载配置失败: %v", err)
 	}
 
+	// 环境变量覆盖默认配置（部署场景，如 Docker/LAN）；命令行参数优先级最高。
+	// LIVE2D_API_HOST 是 README 文档化的主变量，GO_API_HOST 为容器镜像的兼容变量。
+	if envHost := hostFromEnv(os.Getenv); envHost != "" {
+		cfg.Server.Host = envHost
+	}
+
 	// 命令行参数覆盖配置
 	if *host != "" {
 		cfg.Server.Host = *host
 	}
 	if *port != 0 {
 		cfg.Server.Port = *port
+	}
+
+	// 显式绑定到非回环地址意味着局域网/公网可达，而本服务无登录鉴权，
+	// 必须在启动横幅里给出明确警告和收紧指引。
+	if !isLoopbackHost(cfg.Server.Host) {
+		log.Printf("[warn] 服务监听在 %s（非本机回环）：同一网络内的任何设备都可不经验证访问全部接口。"+
+			"如仅本机使用，请设 LIVE2D_API_HOST=127.0.0.1；确需远程访问请配合防火墙与 LIVE2D_ALLOWED_HOSTS。",
+			cfg.Server.Host)
 	}
 
 	// 设置最大并发数为 CPU 核心数的 2 倍
@@ -77,6 +92,12 @@ func main() {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cfg.Server.MaxRequestBodySize)
 		c.Next()
 	})
+
+	// Host 白名单中间件（P2-2：防 DNS rebinding。浏览器对本地服务的 HTTP
+	// 请求可被攻击者控制的域名借 DNS 重绑定直达，Origin/CORS 拦不住这种同源
+	// 伪装；只接受本机回环主机名 + CORS 白名单来源的主机名 + 显式扩展）。
+	allowedHosts := buildAllowedHosts(cfg.Server.AllowedOrigins, os.Getenv("LIVE2D_ALLOWED_HOSTS"))
+	r.Use(allowedHostMiddleware(allowedHosts))
 
 	// 请求超时中间件
 	r.Use(func(c *gin.Context) {
@@ -374,6 +395,90 @@ func contains(slice []string, item string) bool {
 }
 
 // ========== 安全中间件实现 ==========
+
+// hostFromEnv 解析监听地址的环境变量覆盖。LIVE2D_API_HOST 优先（文档化
+// 主变量），GO_API_HOST 为容器镜像历史兼容变量；均未设置时返回空串，
+// 调用方继续使用配置文件/默认值。
+func hostFromEnv(getenv func(string) string) string {
+	if v := strings.TrimSpace(getenv("LIVE2D_API_HOST")); v != "" {
+		return v
+	}
+	return strings.TrimSpace(getenv("GO_API_HOST"))
+}
+
+// isLoopbackHost 判断绑定地址是否仅本机可达。主机名 localhost 同样按
+// 回环对待；0.0.0.0、::、局域网 IP 等一律视为对外暴露。
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSpace(host)
+	// 注意空串不算回环：Go 对空主机名的 ":port" 会绑定到所有接口。
+	if host == "localhost" {
+		return true
+	}
+	if host == "" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// canonicalHostname 把 Host 头归一化为可比较的小写无端口主机名：
+// "localhost:8080"→"localhost"、"[::1]:8080"→"::1"、去掉根域尾点。
+func canonicalHostname(rawHost string) string {
+	h := strings.ToLower(strings.TrimSpace(rawHost))
+	if h == "" {
+		return ""
+	}
+	// 优先用标准库剥离端口（同时处理 "host:port" 与 "[v6]:port"）
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		h = host
+	}
+	h = strings.TrimPrefix(h, "[")
+	h = strings.TrimSuffix(h, "]")
+	return strings.TrimSuffix(h, ".")
+}
+
+// buildAllowedHosts 汇总允许的 HTTP Host 集合：
+//  1. 本机回环主机名（桌面/Tauri/本机 curl）；
+//  2. CORS 白名单各 Origin 的主机名（部署在自定义域名后同源访问天然合法）；
+//  3. LIVE2D_ALLOWED_HOSTS 逗号分隔的显式扩展（局域网 IP/域名）。
+func buildAllowedHosts(allowedOrigins []string, extraCSV string) map[string]struct{} {
+	hosts := map[string]struct{}{
+		"localhost": {}, "127.0.0.1": {}, "::1": {},
+	}
+	add := func(h string) {
+		h = canonicalHostname(h)
+		if h != "" && h != "*" {
+			hosts[h] = struct{}{}
+		}
+	}
+	for _, origin := range allowedOrigins {
+		if u, err := url.Parse(strings.TrimSpace(origin)); err == nil && u.Host != "" {
+			add(u.Hostname())
+		}
+	}
+	for _, h := range strings.Split(extraCSV, ",") {
+		add(h)
+	}
+	return hosts
+}
+
+// allowedHostMiddleware 在所有路由（含 WebSocket 升级）前校验 Host 头。
+// 空 Host（畸形/HTTP/1.0 探测）与不在白名单的主机名一律 400：此时还未
+// 执行业务逻辑，DNS rebinding 拿不到任何响应体。
+func allowedHostMiddleware(allowed map[string]struct{}) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		host := canonicalHostname(c.Request.Host)
+		if host == "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "缺少合法的 Host 头"})
+			return
+		}
+		if _, ok := allowed[host]; !ok {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "非法的 Host 来源"})
+			return
+		}
+		c.Next()
+	}
+}
 
 // validateRequestMiddleware 输入验证中间件
 func validateRequestMiddleware() gin.HandlerFunc {

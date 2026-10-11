@@ -140,8 +140,9 @@ GET /output/:filename
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `LIVE2D_API_HOST` | 服务器地址 | `0.0.0.0` |
-| `LIVE2D_API_PORT` | 服务器端口 | `8080` |
+| `LIVE2D_API_HOST`（兼容 `GO_API_HOST`） | 监听地址。默认只绑本机回环；局域网访问需显式设 `0.0.0.0`，启动时会给出暴露警告 | `127.0.0.1` |
+| `LIVE2D_ALLOWED_HOSTS` | HTTP Host 头白名单（逗号分隔），防 DNS rebinding；默认放行 localhost/127.0.0.1/::1 及 CORS 来源主机名 | 内置回环集合 |
+| `LIVE2D_API_PORT` | 服务器端口（可用 `-port` 参数覆盖） | `8080` |
 | `LIVE2D_SD_WEBUI_URL` | SD WebUI 地址 | `http://127.0.0.1:7860` |
 | `LIVE2D_PYTHON_PATH` | Python 路径 | `python3` |
 | `LIVE2D_OUTPUT_DIR` | 输出目录 | `../output` |
@@ -153,7 +154,7 @@ GET /output/:filename
 ```json
 {
   "server": {
-    "host": "0.0.0.0",
+    "host": "127.0.0.1",
     "port": 8080
   },
   "sd_webui": {

@@ -253,7 +253,8 @@ def test_segment_rejects_source_outside_output_root(client, tmp_path, monkeypatc
     monkeypatch.setattr(srv, "OUTPUT_DIR", out_root)
 
     r = client.post("/api/segment", json={"image_path": str(secret), "method": "kmeans"})
-    assert r.status_code == 500
+    # P2-4 后请求方错误统一为 400（与 Go ErrPathOutsideBase 契约对齐），不再误报 500
+    assert r.status_code == 400
     body = r.json()
     assert "必须位于输出目录内" in body["error"]
     # 不得回显被拒路径（避免成为文件存在性 oracle）
@@ -286,7 +287,7 @@ def test_resolve_segment_source_relative_path_anchors_at_output_root(tmp_path):
         srv.OUTPUT_DIR = tmp_path
         (tmp_path / "a.png").write_bytes(b"x")
         assert srv._resolve_segment_source("a.png") == tmp_path / "a.png"
-        with pytest.raises(RuntimeError, match="必须位于输出目录内"):
+        with pytest.raises(srv.ClientRequestError, match="必须位于输出目录内"):
             srv._resolve_segment_source(str(tmp_path.parent / "b.png"))
     finally:
         srv.OUTPUT_DIR = original
@@ -340,3 +341,103 @@ def test_tracking_ws_enforces_connection_cap(client, monkeypatch):
     assert srv._TrackerState.ws_clients == 0
     with client.websocket_connect("/ws/tracking") as ws:
         assert ws.receive_json()["type"] == "tracking_ready"
+
+
+# ---------- P2-1/P2-2：默认回环绑定 + HTTP Host 白名单（DNS rebinding） ----------
+def test_server_host_defaults_to_loopback(monkeypatch):
+    # conftest 未设置 LIVE2D_API_HOST/GO_API_HOST，模块默认必须是回环
+    monkeypatch.delenv("LIVE2D_API_HOST", raising=False)
+    monkeypatch.delenv("GO_API_HOST", raising=False)
+    # 模块在无环境变量的正常启动路径下应取到 127.0.0.1（当前进程即如此）
+    assert srv.SERVER_HOST == "127.0.0.1"
+
+
+def test_allowed_hosts_set_construction():
+    hosts = srv._build_allowed_hosts()
+    # 回环三件套恒在
+    assert {"localhost", "127.0.0.1", "::1"} <= hosts
+    # 从 CORS 白名单派生（本地工作台主机名）
+    assert "localhost" in hosts
+    # 通配符不得进入白名单
+    assert "*" not in hosts
+
+
+def test_http_rejects_non_whitelisted_host():
+    # DNS rebinding 主攻击向量：Host 是攻击者域名（即使 IP 解析到 127.0.0.1）
+    with TestClient(srv.app, base_url="http://evil.example") as c:
+        r = c.get("/api/health")
+    assert r.status_code == 400
+    assert "Host" in r.json()["error"]
+
+
+@pytest.mark.parametrize("base", ["http://localhost:8080", "http://127.0.0.1:8080"])
+def test_http_allows_loopback_hosts(base):
+    with TestClient(srv.app, base_url=base) as c:
+        r = c.get("/api/health")
+    assert r.status_code == 200, r.text
+
+
+# ---------- P2-C：统一安全响应头 ----------
+def test_security_headers_on_success_and_error(client):
+    r = client.get("/api/health")
+    for h in ("X-Content-Type-Options", "X-Frame-Options",
+              "Referrer-Policy", "Content-Security-Policy"):
+        assert r.headers.get(h), f"成功响应缺少安全头 {h}"
+    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    # 业务错误响应（走完整中间件链）同样带头
+    r404 = client.get("/output/no_such_file.png")
+    assert r404.status_code == 404
+    assert r404.headers.get("X-Content-Type-Options") == "nosniff"
+
+
+# ---------- P2-C：远程限流（回环豁免） ----------
+def test_rate_limiter_unit():
+    lim = srv._RateLimiter(limit=2, window=60)
+    now = 1000.0
+    assert lim.check("192.168.1.99", now=now) == 0
+    assert lim.check("192.168.1.99", now=now + 1) == 0
+    # 第 3 次必须拒绝并给出 Retry-After
+    retry = lim.check("192.168.1.99", now=now + 2)
+    assert retry >= 50
+    # 窗口滚动后自动恢复
+    assert lim.check("192.168.1.99", now=now + 61) == 0
+    # 回环永远豁免
+    assert lim.check("127.0.0.1", now=now) == 0
+    assert lim.check("::1", now=now) == 0
+
+
+def test_rate_limiter_disabled_when_zero():
+    assert srv._RateLimiter(limit=0).check("192.168.1.99", now=0.0) == 0
+
+
+def test_remote_client_rate_limited_via_middleware(client, monkeypatch):
+    # TestClient 的对端主机名是 testclient（非回环），用极小配额模拟远程滥用
+    monkeypatch.setattr(srv, "_rate_limiter", srv._RateLimiter(limit=2))
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/api/health").status_code == 200
+    blocked = client.get("/api/health")
+    assert blocked.status_code == 429
+    assert int(blocked.headers["Retry-After"]) >= 1
+
+
+def test_is_loopback_predicate():
+    assert srv._is_loopback("127.0.0.1")
+    assert srv._is_loopback("[::1]") is False  # 带括号不是裸 IP
+    assert srv._is_loopback("::1")
+    assert not srv._is_loopback("192.168.1.5")
+    assert not srv._is_loopback("evil.example")
+
+
+# ---------- P2-D：未预期异常 500 脱敏 ----------
+def test_unexpected_error_does_not_leak_internal_paths(client, tmp_path):
+    # 把 latest 记录指向一个目录，open() 必抛 IsADirectoryError（含 tmp 绝对路径）
+    monkeypatch_target = srv.LATEST_GEN_FILE
+    srv.LATEST_GEN_FILE = tmp_path
+    try:
+        r = client.get("/api/generations/latest")
+        assert r.status_code == 500
+        body = r.text
+        assert "请稍后重试" in body
+        assert str(tmp_path) not in body
+    finally:
+        srv.LATEST_GEN_FILE = monkeypatch_target

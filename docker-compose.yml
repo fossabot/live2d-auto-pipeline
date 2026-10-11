@@ -13,7 +13,11 @@ services:
       - ./assets:/app/assets      # Characters, output, models
       - ./output:/app/output      # Generated files
     environment:
+      # 容器内监听所有网卡，宿主侧靠上面的 127.0.0.1 端口绑定兜底，
+      # 不对局域网暴露；ALLOWED_HOSTS 放行容器健康检查与本机映射访问。
       - GO_API_HOST=0.0.0.0
+      - LIVE2D_API_HOST=0.0.0.0
+      - LIVE2D_ALLOWED_HOSTS=localhost,127.0.0.1
       - GO_API_PORT=8080
       - LIVE2D_PROJECT_ROOT=/app
       - NEXT_PUBLIC_API_URL=http://localhost:8080

@@ -76,7 +76,12 @@ ENV PGID=1000
 # Environment
 ENV PYTHONPATH=/app
 ENV LIVE2D_PROJECT_ROOT=/app
+# 容器内必须绑 0.0.0.0 端口映射才能从宿主访问；宿主侧是否暴露由
+# docker-compose 的端口绑定决定（默认 127.0.0.1:8080:8080，仅本机）。
+# 桌面直装形态不读这些变量，应用内置默认是 127.0.0.1。
 ENV GO_API_HOST=0.0.0.0
+ENV LIVE2D_API_HOST=0.0.0.0
+ENV LIVE2D_ALLOWED_HOSTS=localhost,127.0.0.1
 ENV GO_API_PORT=8080
 ENV NEXT_PUBLIC_API_URL=http://localhost:8080
 

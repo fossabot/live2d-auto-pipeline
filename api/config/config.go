@@ -203,7 +203,11 @@ func DefaultConfig() *Config {
 
 	return &Config{
 		Server: ServerConfig{
-			Host:               "0.0.0.0",
+			// 安全默认：桌面形态只监听本机回环，同局域网设备无法无鉴权访问
+			//（花 API 额度生图、读取 output 产物、驱动摄像头流程等）。
+			// 确需局域网访问时，用 LIVE2D_API_HOST/GO_API_HOST 环境变量或
+			// -host 命令行参数显式绑定 0.0.0.0；容器入口已显式覆盖。
+			Host:               "127.0.0.1",
 			Port:               8080,
 			MaxRequestBodySize: 10 * 1024 * 1024,
 			MaxHeaderBytes:     1 * 1024 * 1024,

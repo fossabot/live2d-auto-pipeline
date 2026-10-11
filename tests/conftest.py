@@ -9,6 +9,13 @@ import pytest
 import numpy as np
 from PIL import Image
 
+# 测试环境的安全护栏配置，必须在任何 `import api_server` 之前生效
+#（pytest 保证 conftest 先于测试模块加载）：
+# - TestClient(httpx) 默认 Host 为 testserver，加入 Host 白名单；
+# - 关闭限流（0=不限），避免用例共享分钟窗口时互相误伤。
+os.environ.setdefault("LIVE2D_ALLOWED_HOSTS", "testserver,localhost,127.0.0.1,::1")
+os.environ.setdefault("LIVE2D_RATE_LIMIT_PER_MIN", "0")
+
 # Ensure project root is on path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))

@@ -59,9 +59,9 @@ NOT_IMPLEMENTED（仅 Go API 实现，本服务回 501）：
     POST /api/cache/clear
 
 启动方式:
-    python api_server.py
-    # 或
-    uvicorn api_server:app --host 0.0.0.0 --port 8080
+    python api_server.py            # 默认只监听 127.0.0.1:8080
+    # 确需局域网访问时显式覆盖：
+    LIVE2D_API_HOST=0.0.0.0 python api_server.py
 """
 
 import os
@@ -71,10 +71,13 @@ import time
 import uuid
 import shutil
 import asyncio
+import ipaddress
+import logging
 import tempfile
 import zipfile
 import re
 import threading
+from urllib.parse import urlparse
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -97,6 +100,14 @@ CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
 
 VERSION = "v0.10.3-py"
 SERVER_PORT = 8080  # v0.10.3: 与 Go 后端及前端代理目标一致
+# 安全默认：只监听本机回环（与 Go 服务同一策略），避免同 WiFi/局域网设备
+# 无鉴权调用（耗 API 额度、读 output 产物、驱动摄像头）。确需局域网访问时
+# 显式设置 LIVE2D_API_HOST=0.0.0.0（容器镜像已显式设置）。
+SERVER_HOST = (
+    os.environ.get("LIVE2D_API_HOST", "").strip()
+    or os.environ.get("GO_API_HOST", "").strip()
+    or "127.0.0.1"
+)
 START_TIME = time.time()
 
 # 生图尺寸安全区间（与 Go 服务 ClampImageDimensions 保持一致）：
@@ -235,7 +246,10 @@ async def lifespan(app: FastAPI):
     print(f"  🎨 Live2D Master Agent API {VERSION} (Python Edition)")
     print(f"  高性能 FastAPI 版本 - 直接调用 core 模块")
     print(f"{'='*60}")
-    print(f"  服务地址: http://0.0.0.0:{SERVER_PORT}")
+    print(f"  服务地址: http://{SERVER_HOST}:{SERVER_PORT}")
+    if SERVER_HOST not in ("127.0.0.1", "localhost", "::1"):
+        print(f"  ⚠️  监听在 {SERVER_HOST}：同一网络内的设备可不经验证访问本服务，"
+              f"请确认防火墙与 LIVE2D_ALLOWED_HOSTS 配置")
     print(f"  输出目录: {OUTPUT_DIR}")
     print(f"  项目根目录: {PROJECT_ROOT}")
     print(f"{'='*60}\n")
@@ -299,6 +313,127 @@ def _ws_origin_allowed(websocket: WebSocket) -> bool:
     return origin == "" or origin in _WS_ALLOWED_ORIGINS
 
 
+# ---------- HTTP 安全护栏（与 Go 服务 main.go 中间件链对齐）----------
+# Host 白名单：DNS rebinding 防御。恶意网页可把自己的域名解析到 127.0.0.1，
+# 借浏览器对「同源」的信任直连本地服务（CORS/Origin 拦不住这种 Host 伪装）。
+# 允许集合 = 回环主机名 + CORS 白名单各 Origin 的主机名 + 环境变量显式扩展。
+def _build_allowed_hosts() -> set:
+    hosts = {"localhost", "127.0.0.1", "::1"}
+    for origin in CORS_ORIGINS:
+        if origin == "*":
+            continue
+        hostname = urlparse(origin).hostname
+        if hostname:
+            hosts.add(hostname.lower().rstrip("."))
+    for h in os.environ.get("LIVE2D_ALLOWED_HOSTS", "").split(","):
+        h = h.strip().lower().rstrip(".")
+        if h and h != "*":
+            hosts.add(h)
+    return hosts
+
+
+_ALLOWED_HOSTS = _build_allowed_hosts()
+
+# 远程（非回环）客户端限流：与 Go rateLimitMiddleware 同一语义——
+# 本机回环豁免（桌面 UI/健康轮询/同机脚本不受限），其他来源 60 次/分，
+# 0 = 不限制（离线批处理/测试）。直接取 TCP 对端 IP，不信任任何代理头。
+def _env_rate_limit() -> int:
+    raw = os.environ.get("LIVE2D_RATE_LIMIT_PER_MIN", "").strip()
+    if raw == "":
+        return 60
+    try:
+        val = int(raw)
+        if val < 0:
+            raise ValueError
+        return val
+    except ValueError:
+        print(f"⚠️  LIVE2D_RATE_LIMIT_PER_MIN={raw!r} 非法，回退默认 60/分")
+        return 60
+
+
+_RATE_LIMIT_PER_MIN = _env_rate_limit()
+_RATE_WINDOW_SEC = 60
+
+
+class _RateLimiter:
+    """按客户端 IP 的固定分钟窗口计数（线程安全；asyncio 单线程但留锁防未来迁移）。"""
+
+    def __init__(self, limit: int, window: int = _RATE_WINDOW_SEC):
+        self.limit = limit
+        self.window = window
+        self._hits: Dict[str, int] = {}
+        self._reset: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def check(self, client: Optional[str], now: Optional[float] = None) -> int:
+        """返回 0 表示放行；否则返回建议的 Retry-After 秒数。"""
+        if self.limit <= 0 or client is None or _is_loopback(client):
+            return 0
+        now = now if now is not None else time.time()
+        with self._lock:
+            reset_at = self._reset.get(client, 0.0)
+            if now >= reset_at:
+                self._hits[client] = 1
+                self._reset[client] = now + self.window
+                return 0
+            if self._hits.get(client, 0) >= self.limit:
+                return max(1, int(reset_at - now))
+            self._hits[client] = self._hits.get(client, 0) + 1
+            # 顺手做懒清理，避免异常来源 IP 无限堆积
+            if len(self._hits) > 4096:
+                expired = [k for k, t in self._reset.items() if t <= now]
+                for k in expired:
+                    self._hits.pop(k, None)
+                    self._reset.pop(k, None)
+            return 0
+
+
+def _is_loopback(host_or_ip: str) -> bool:
+    h = host_or_ip.strip().lower()
+    if h in ("127.0.0.1", "::1", "localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+_rate_limiter = _RateLimiter(_RATE_LIMIT_PER_MIN)
+
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Content-Security-Policy": "default-src 'self'",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+}
+
+
+@app.middleware("http")
+async def _security_guard(request, call_next):
+    # 1) Host 白名单：畸形/空 Host 与非白名单主机名一律拒绝，不进入任何业务逻辑。
+    host = (request.url.hostname or "").lower().rstrip(".")
+    if not host or host not in _ALLOWED_HOSTS:
+        return JSONResponse(
+            {"success": False, "error": "非法的 Host 来源"}, status_code=400
+        )
+    # 2) 远程限流（回环豁免）。
+    client = request.client.host if request.client else None
+    retry_after = _rate_limiter.check(client)
+    if retry_after:
+        return JSONResponse(
+            {"success": False, "error": "请求过于频繁，请稍后再试"},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+    # 3) 统一安全响应头（含 FileResponse/错误响应）。
+    response = await call_next(request)
+    for k, v in _SECURITY_HEADERS.items():
+        response.headers.setdefault(k, v)
+    return response
+
+
 # ---------- 工具函数 ----------
 def ok(data: Any = None, message: str = "") -> Dict[str, Any]:
     return {"success": True, "message": message, "data": data}
@@ -309,6 +444,14 @@ def err(error: str, code: int = 400) -> JSONResponse:
         status_code=code,
         content={"success": False, "error": error, "data": None},
     )
+
+
+def _server_error(where: str, e: Exception) -> JSONResponse:
+    """未预期异常统一出口（P2-4）：完整堆栈只写服务端日志，响应体给固定
+    中文文案，不把异常原文（可能含绝对路径、上游 URL/Key 片段）回传客户端。
+    业务校验类失败请继续使用 err() 返回具体可读提示。"""
+    logging.getLogger("api_server").exception("%s 失败: %s", where, e)
+    return err(f"{where}服务暂不可用，请稍后重试", 500)
 
 
 def not_implemented(feature: str, go_endpoint: str = "") -> JSONResponse:
@@ -616,7 +759,7 @@ async def generate_image(req: GenerateRequest):
     except asyncio.TimeoutError:
         return err(_timeout_message("图像生成", GEN_TIMEOUT, "LIVE2D_GEN_TIMEOUT"), 504)
     except Exception as e:
-        return err(f"图像生成失败: {e}", 500)
+        return _server_error("图像生成", e)
 
 
 def _run_generate_character(req: "GenerateCharacterRequest") -> Dict[str, Any]:
@@ -676,7 +819,7 @@ async def generate_character(req: GenerateCharacterRequest):
             504,
         )
     except Exception as e:
-        return err(f"角色生成失败: {e}", 500)
+        return _server_error("角色生成", e)
 
 
 @app.get("/api/generations/latest")
@@ -688,7 +831,13 @@ async def latest_generation():
         with open(LATEST_GEN_FILE, "r", encoding="utf-8") as f:
             return ok(json.load(f))
     except Exception as e:
-        return err(f"读取最近生成记录失败: {e}", 500)
+        return _server_error("读取最近生成记录", e)
+
+
+class ClientRequestError(Exception):
+    """请求方错误（参数/路径不合法）。消息本身不含内部路径，可安全回显，
+    端点统一映射为 400——与 Go 侧 ErrPathOutsideBase → 400 的契约对齐，
+    避免把客户端错误误报成 500（也避免 500 脱敏吞掉可读的业务提示）。"""
 
 
 def _resolve_segment_source(src: str) -> Path:
@@ -700,14 +849,14 @@ def _resolve_segment_source(src: str) -> Path:
     目录（本地文件外传）。相对路径按 OUTPUT_DIR 解析（生成/上传产物都在此根下）。
     """
     if not src:
-        raise RuntimeError("找不到可用的源图片，请先生成角色图")
+        raise ClientRequestError("找不到可用的源图片，请先生成角色图")
     p = Path(src)
     if not p.is_absolute():
         p = OUTPUT_DIR / p
     if not _within_output_root(p):
-        raise RuntimeError("源图片必须位于输出目录内")
+        raise ClientRequestError("源图片必须位于输出目录内")
     if not p.is_file():
-        raise RuntimeError("找不到可用的源图片，请先生成角色图")
+        raise ClientRequestError("找不到可用的源图片，请先生成角色图")
     return p
 
 
@@ -768,10 +917,13 @@ async def segment_image(req: SegmentRequest):
     try:
         data = await _to_thread_bounded(_run_segment, SEGMENT_TIMEOUT, req)
         return ok(data, "分层完成")
+    except ClientRequestError as e:
+        # 源图路径越界/缺失等请求方错误：文案安全，回 400（与 Go 侧一致）
+        return err(str(e), 400)
     except asyncio.TimeoutError:
         return err(_timeout_message("分层", SEGMENT_TIMEOUT, "LIVE2D_SEGMENT_TIMEOUT"), 504)
     except Exception as e:
-        return err(f"分层失败: {e}", 500)
+        return _server_error("图像分层", e)
 
 
 # ---------- PSD / 分层 ----------
@@ -950,12 +1102,15 @@ async def export_live2d(req: ExportLive2DRequest):
             **runtime_readiness(result),
         }, "Live2D 模型导出成功")
     except Exception as e:
+        # 未预期构建错误：详情（含临时目录/路径）只进日志，前端拿固定文案。
+        # 业务性失败（如「缺少图层」）在 try 内部已提前 return，不会走到这里。
+        logging.getLogger("api_server").exception("Live2D 导出失败: %s", e)
         return ok({
             "success": False,
             "model3_url": "",
             "model_path": "",
-            "message": str(e),
-        }, f"导出失败: {e}")
+            "message": "导出服务暂不可用，请稍后重试",
+        }, "导出失败，请稍后重试")
 
 
 @app.get("/api/export/package")
@@ -1009,7 +1164,11 @@ async def deploy_desktop(req: DeployDesktopRequest):
 
         result = await _to_thread_bounded(_run_deploy_desktop, DEPLOY_TIMEOUT, str(candidate))
         if not result.get("success"):
-            return err(result.get("error", "桌宠打包失败"), 500)
+            # 打包器内部失败原因只记日志，响应给固定文案，避免内部路径外泄
+            logging.getLogger("api_server").error(
+                "桌宠打包失败: %s", result.get("error", "")
+            )
+            return err("桌宠打包服务暂不可用，请稍后重试", 500)
         pkg_dir = result.get("package_dir", "")
         return ok({
             "success": True,
@@ -1020,7 +1179,7 @@ async def deploy_desktop(req: DeployDesktopRequest):
     except asyncio.TimeoutError:
         return err(_timeout_message("桌宠打包", DEPLOY_TIMEOUT, "LIVE2D_DEPLOY_TIMEOUT"), 504)
     except Exception as e:
-        return err(f"桌宠部署失败: {e}", 500)
+        return _server_error("桌宠部署", e)
 
 
 # ---------- LLM 对话 ----------
@@ -1077,8 +1236,10 @@ async def chat(req: ChatRequest):
             raise RuntimeError("模型未返回内容")
         return ok({"reply": reply, "emotion": emotion}, "对话完成")
     except Exception as e:
+        # 上游错误原文（可能含内部 URL/Key 片段）只进日志，回复用固定文案
+        logging.getLogger("api_server").exception("对话失败: %s", e)
         return ok({
-            "reply": f"（对话功能暂不可用：{e}）\n\n我听到你说：「{req.message}」",
+            "reply": f"（对话功能暂不可用，请稍后再试）\n\n我听到你说：「{req.message}」",
             "emotion": "neutral",
         }, "对话功能降级模式")
 
@@ -1102,8 +1263,9 @@ async def chat_stream(req: ChatRequest):
                     raise RuntimeError(chunk.get("error", "对话出错"))
             yield f"data: {json.dumps({'finished': True, 'type': 'done'})}\n\n"
         except Exception as e:
-            # 降级模式：逐字返回
-            text = f"（对话功能暂不可用：{e}）\n\n我听到你说：「{req.message}」"
+            # 降级模式：逐字返回。异常详情只进日志，不拼进给用户的文本。
+            logging.getLogger("api_server").exception("流式对话失败: %s", e)
+            text = f"（对话功能暂不可用，请稍后再试）\n\n我听到你说：「{req.message}」"
             for char in text:
                 yield f"data: {json.dumps({'chunk': char, 'type': 'text'})}\n\n"
                 await asyncio.sleep(0.03)
@@ -1223,7 +1385,9 @@ async def tracking_start():
     try:
         from drivers.face_tracker.mediapipe_tracker import FaceTracker
     except Exception as e:
-        return err(f"面捕模块不可用: {e}", 500)
+        # 模块缺失/加载失败的原文（含安装路径）只进日志
+        logging.getLogger("api_server").exception("面捕模块加载失败: %s", e)
+        return err("面捕模块当前不可用，请检查依赖安装", 500)
 
     def _open():
         from drivers.face_tracker.mediapipe_tracker import FaceTracker
@@ -1240,7 +1404,7 @@ async def tracking_start():
             504,
         )
     except Exception as e:
-        return err(f"摄像头启动失败: {e}", 500)
+        return _server_error("摄像头启动", e)
 
     _TrackerState.tracker = tracker
     _TrackerState.lock = threading.Lock()
@@ -1377,7 +1541,7 @@ if __name__ == "__main__":
     # 此前端口不一致会导致降级模式（python api_server.py）启动后前端所有请求 404。
     uvicorn.run(
         "api_server:app",
-        host="0.0.0.0",
+        host=SERVER_HOST,
         port=SERVER_PORT,
         reload=False,
         log_level="info",
