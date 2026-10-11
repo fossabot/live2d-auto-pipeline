@@ -103,7 +103,20 @@ python -m core.cli
 
 就这么简单。如果你的网络能访问 pollinations.ai，几十秒内你就能在 `output/` 目录看到生成的角色立绘。
 
-### 完整启动（Web 工作台）
+### 桌面应用（推荐 — 直接利用本地 GPU/CPU）
+
+```bash
+# Windows：双击运行
+# 首次：双击 install.bat 安装
+# 之后：双击 start.bat 启动
+
+# 或从 Release 页面下载安装包：
+# https://github.com/mw2wbyys6t-sudo/live2d-auto-pipeline/releases
+```
+
+桌面应用将前端 UI 内嵌进单个 Go 二进制，同源服务、无需额外端口，直接调用本机 GPU/CPU 进行 AI 推理。
+
+### 开发模式（前后端分离调试）
 
 需要两个终端：
 
@@ -111,28 +124,11 @@ python -m core.cli
 # 终端 1 — 启动 Python 后端（端口 8080）
 python api_server.py
 
-# 终端 2 — 启动前端
+# 终端 2 — 启动前端开发服务器
 cd web && npm install && npm run dev
 ```
 
-然后打开 **http://localhost:3000**，你会看到一个 8 页面的工作台。
-
-### Windows 双击运行
-
-```bash
-# 首次：双击 install.bat 安装
-# 之后：双击 start.bat 启动
-```
-
-### Docker
-
-```bash
-cp .env.example .env   # 可选，不配 Key 也能用免费功能
-docker compose up -d --build
-# Web: http://localhost:3000  API: http://localhost:8080
-```
-
-> ⚠️ 国内拉 Docker Hub 镜像可能超时，需要在 Docker Desktop 设置代理或切换网络。
+开发模式下打开 **http://localhost:3000**，前端通过 rewrites 代理连接后端。
 
 ---
 

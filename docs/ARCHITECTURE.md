@@ -90,4 +90,4 @@
 | 后端 | Go + Gin | 高性能、并发安全 |
 | 前端 | Next.js + PixiJS | React生态+WebGL渲染 |
 | 实时通信 | WebSocket + SSE | 双向+流式 |
-| 部署 | Docker + GitHub Actions | 一键部署+CI/CD |
+| 部署 | 桌面应用 (Go embed) + GitHub Actions | 内嵌 UI 单二进制分发 |

@@ -628,7 +628,7 @@ export class APIClient {
         apiConnected: true,
         latencyMs: 0,
         gpuAvailable: false,
-        version: (data.version as string) ?? 'v0.10.4',
+        version: (data.version as string) ?? 'v0.10.5',
         modelsLoaded: services.map((s) => s.name),
         providers: services.map((s) => ({
           id: s.name as never,

@@ -2,20 +2,12 @@
 
 ## 安装
 
-### Windows
+### Windows 桌面应用（推荐）
+从 [Release](https://github.com/mw2wbyys6t-sudo/live2d-auto-pipeline/releases) 下载安装包，双击安装即可。
+
+### 从源码运行
 1. 安装 Python 3.11+ 和 Node.js 18+
-2. 双击 `install.bat`
-
-### macOS / Linux
-```bash
-bash install.sh
-```
-
-### Docker
-```bash
-docker compose up -d
-# Web: http://localhost:3000  API: http://localhost:8080
-```
+2. Windows 双击 `install.bat`，或 macOS/Linux 执行 `bash install.sh`
 
 ## 第一个角色
 

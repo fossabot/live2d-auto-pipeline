@@ -4,6 +4,41 @@
 
 ---
 
+## [v0.10.5] — 2026-10-11 — 代号「Desktop First」
+
+> **本版目标**：全面转向桌面应用为唯一分发形态。移除 Docker 和独立 Web 部署模式，保留 Next.js 前端用于桌面内嵌和开发调试。核心动机：AI 推理需要直接利用本地 GPU/CPU，容器化部署无法高效访问硬件加速。
+
+### 🔴 架构变更（BREAKING）
+
+#### 移除 Docker 部署
+- **删除** `Dockerfile`（三阶段构建：Go API + Next.js Web + Python 运行时）
+- **删除** `docker-compose.yml`（All-in-one 服务编排，含独立前端服务 :3000）
+- **删除** `.dockerignore`
+- **删除** `deploy/docker/entrypoint.sh`（含独立启动 Next.js `next start -p 3000` 逻辑）
+- **CI 移除** `docker-build` job 及 `release` 的 `needs` 依赖
+
+#### 移除 Web 托管配置
+- **删除** `web/public/_headers`（Cloudflare Pages / Netlify 专用安全头；桌面版由 Go 同源服务统一注入安全头）
+
+### 🔵 保留与调整
+
+#### 保留 Next.js 前端源码
+- `web/` 目录完整保留——桌面版仍需 Next.js 静态导出（`output: 'export'`）嵌入 Go 二进制
+- `next.config.js` 保留双模式：`NEXT_STATIC_EXPORT=1`（桌面构建）vs 默认 standalone + rewrites（开发调试）
+
+#### 文档更新
+- `README.md`：桌面应用提为推荐方式，Docker 章节移除，独立 Web 启动降级为「开发模式」
+- `docs/DEPLOY.md`：重写为桌面安装指南为主，补充源码构建桌面应用的完整流程
+- `docs/QUICKSTART.md`：安装章节改为桌面应用优先
+- `docs/ARCHITECTURE.md`：技术栈表中部署方案更新为「桌面应用 (Go embed)」
+
+### 已知限制
+
+- 开发模式仍需手动启动两个终端（Python 后端 + Next.js 开发服务器）
+- macOS / Linux 桌面打包脚本尚未完善（当前主要支持 Windows Inno Setup 安装包）
+
+---
+
 ## [v0.10.4] — 2026-10-11 — 代号「Hardened Shell」
 
 > **本版目标**：系统性安全加固——堵住 5 类审计发现的安全缺陷，覆盖前端面捕、文件导出、静态产物服务、SSRF 防护和批量导入内存安全。

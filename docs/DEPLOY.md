@@ -1,56 +1,60 @@
 # 🚀 部署指南
 
-## Docker 部署（推荐）
+> v0.10.5 起，项目全面转向**桌面应用**为唯一分发形态，直接利用本地 GPU/CPU 进行 AI 推理。
+> Docker 和独立 Web 部署模式已废弃移除。
+
+---
+
+## 桌面安装（推荐）
+
+### Windows 安装包
+
+从 [Release 页面](https://github.com/mw2wbyys6t-sudo/live2d-auto-pipeline/releases) 下载最新的 `.exe` 安装包，双击即可安装。
+
+安装包包含：
+- Go API 二进制（内嵌前端 UI）
+- 便携 Python 运行时
+- AI 模型权重（SAM 等）
+- 所有系统依赖（OpenCV、FFmpeg 等）
+
+### 从源码构建桌面应用
 
 ```bash
-# 克隆项目
-git clone https://github.com/mw2wbyys6t-sudo/Live2D.git
-cd Live2D
+# 1. 安装依赖
+pip install -r requirements.txt
+cd web && npm ci && cd ..
+cd api && go mod download && cd ..
 
-# 配置环境变量
-cp .env.example .env
-# 编辑 .env 添加 API Key（可选）
+# 2. 一键构建桌面应用
+# Windows:
+scripts\build_desktop.bat
+# Linux/macOS:
+chmod +x scripts/build_desktop.sh && scripts/build_desktop.sh
 
-# 启动
-docker compose up -d
-
-# 查看日志
-docker compose logs -f
+# 3. 产物在 dist/ 目录
+# dist/Live2DMasterAgent.exe        — 无控制台版本
+# dist/Live2DMasterAgent-console.exe — 调试版本（带控制台输出）
 ```
 
-访问 http://localhost:3000 使用 Web 工作台。
+构建流程：`NEXT_STATIC_EXPORT=1 npm run build` → 复制 `web/out/*` → `api/webui/dist/` → `go build`（内嵌 UI）
 
-## 手动部署（服务器）
+---
+
+## 开发模式
+
+开发时前后端分离运行，方便热更新调试：
 
 ```bash
-# 1. 安装系统依赖
-sudo apt update && sudo apt install -y python3.11 python3-pip nodejs npm golang-go
+# 终端 1 — Python 后端 + Go API
+python api_server.py          # Python 服务（端口 8080）
 
-# 2. 安装 Python 依赖
-pip3 install -r requirements.txt
-
-# 3. 编译 Go API
-cd api && go build -o live2d-api . && cd ..
-
-# 4. 构建前端
-cd web && npm ci && npm run build && cd ..
-
-# 5. 启动服务
-./api/live2d-api &          # API on :8080
-cd web && npx next start -p 3000 &  # Web on :3000
+# 终端 2 — Next.js 开发服务器
+cd web && npm run dev         # 前端开发服务器（端口 3000）
 ```
 
-## 本地开发
+开发模式下，Next.js 通过 `rewrites` 代理将 `/api/*`、`/output/*`、`/ws/*` 转发到后端 8080 端口，无需 CORS 配置。
 
-```bash
-# 一键安装开发环境
-python install.py --dev
-
-# 运行测试
-python -m pytest tests/ -v
-cd api && go test ./...
-cd web && npm run build
-```
+---
 
 ## 环境变量
 
