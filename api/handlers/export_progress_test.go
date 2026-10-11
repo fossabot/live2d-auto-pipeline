@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -270,7 +271,7 @@ func TestExportWithoutHubKeepsLegacyPath(t *testing.T) {
 	h := &Handler{cfg: cfg, pythonBridge: services.NewPythonBridge(cfg)}
 
 	result, err := h.exportLive2DModelTracked(
-		"char", layersDir, filepath.Join(workRoot, "export"))
+		context.Background(), "char", layersDir, filepath.Join(workRoot, "export"))
 	if err == nil {
 		t.Fatalf("不存在的解释器必须报错，实得 %v", result)
 	}
@@ -299,7 +300,7 @@ func TestExportWithHubStillReturnsSameContract(t *testing.T) {
 	h := &Handler{cfg: cfg, pythonBridge: services.NewPythonBridge(cfg), wsHub: hub}
 
 	result, err := h.exportLive2DModelTracked(
-		"char", layersDir, filepath.Join(workRoot, "export"))
+		context.Background(), "char", layersDir, filepath.Join(workRoot, "export"))
 	if err == nil || result != nil {
 		t.Fatalf("失败情形要与旧路径一致，实得 result=%v err=%v", result, err)
 	}

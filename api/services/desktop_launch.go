@@ -2,6 +2,7 @@ package services
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -27,7 +28,7 @@ func copyDesktopResult(src map[string]interface{}) map[string]interface{} {
 	return dst
 }
 
-func (pb *PythonBridge) DeployDesktopModel(modelDir string) (map[string]interface{}, error) {
+func (pb *PythonBridge) DeployDesktopModel(ctx context.Context, modelDir string) (map[string]interface{}, error) {
 	desktopLaunchMu.Lock()
 	defer desktopLaunchMu.Unlock()
 	if runtime.GOOS != "windows" {
@@ -41,7 +42,7 @@ func (pb *PythonBridge) DeployDesktopModel(modelDir string) (map[string]interfac
 			return nil, fmt.Errorf("已有桌宠正在运行，请先关闭现有桌宠窗口")
 		}
 	}
-	report, err := pb.VerifyDesktopModel(modelDir)
+	report, err := pb.VerifyDesktopModel(ctx, modelDir)
 	if err != nil {
 		return nil, err
 	}

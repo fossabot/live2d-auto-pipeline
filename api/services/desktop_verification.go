@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -11,7 +12,7 @@ import (
 // Only one local GPU verification at a time; never trust a client report.
 var desktopVerificationSlot = make(chan struct{}, 1)
 
-func (pb *PythonBridge) VerifyDesktopModel(modelDir string) (map[string]interface{}, error) {
+func (pb *PythonBridge) VerifyDesktopModel(ctx context.Context, modelDir string) (map[string]interface{}, error) {
 	select {
 	case desktopVerificationSlot <- struct{}{}:
 		defer func() { <-desktopVerificationSlot }()
@@ -47,7 +48,7 @@ func (pb *PythonBridge) VerifyDesktopModel(modelDir string) (map[string]interfac
 		return nil, fmt.Errorf("模型目录必须包含唯一 model3 清单")
 	}
 	script := filepath.Join(pb.cfg.Python.ScriptsDir, "drivers", "live2d_runtime", "verify.py")
-	raw, err := pb.executePythonScript(script, []string{manifests[0]}, 90*time.Second)
+	raw, err := pb.executePythonScript(ctx, []string{script, manifests[0]}, 90*time.Second)
 	if err != nil {
 		return nil, err
 	}

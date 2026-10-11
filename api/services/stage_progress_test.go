@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -380,7 +381,7 @@ stage_events.close_open(stage_events.STATUS_ADVANCED)
 print(json.dumps({"ok": True}))
 `, root)
 
-	result, err := pb.runInlinePythonStreaming(code, 90*time.Second, tracker)
+	result, err := pb.runInlinePythonStreaming(context.Background(), code, 90*time.Second, tracker)
 	if err != nil {
 		t.Fatalf("真实 Python 执行失败: %v", err)
 	}
@@ -425,7 +426,7 @@ func TestStreamingFailureAndTimeoutMatchLegacyErrors(t *testing.T) {
 
 	t.Run("异常退出", func(t *testing.T) {
 		tracker, events := collectTracker("boom")
-		_, err := pb.runInlinePythonStreaming(fmt.Sprintf(`
+		_, err := pb.runInlinePythonStreaming(context.Background(), fmt.Sprintf(`
 import sys
 sys.path.insert(0, %q)
 from core.logger import get_logger
@@ -452,7 +453,7 @@ raise RuntimeError("kaboom")
 
 	t.Run("超时报 ErrPythonTimeout", func(t *testing.T) {
 		tracker, _ := collectTracker("slow")
-		_, err := pb.runInlinePythonStreaming("import time; time.sleep(30)",
+		_, err := pb.runInlinePythonStreaming(context.Background(), "import time; time.sleep(30)",
 			1500*time.Millisecond, tracker)
 		if !errors.Is(err, ErrPythonTimeout) {
 			t.Fatalf("超时必须包装 ErrPythonTimeout，实得 %v", err)
@@ -482,7 +483,7 @@ func TestRealExportScriptStreamsStagesWithoutBreakingResult(t *testing.T) {
 
 	tracker, events := collectTracker("real-export")
 	code := exportStagePythonCode(root, layers, out, "goptr", "real-export")
-	result, err := pb.runInlinePythonStreaming(code,
+	result, err := pb.runInlinePythonStreaming(context.Background(), code,
 		time.Duration(pb.cfg.Python.ExportTimeoutSec)*time.Second, tracker)
 	if err != nil {
 		t.Fatalf("真实导出在流式通道里失败: %v", err)

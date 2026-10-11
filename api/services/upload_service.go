@@ -98,6 +98,7 @@ func ImportPNGSet(cfg *config.Config, files []*multipart.FileHeader) (string, []
 	}
 	// 图层导入仅接受标准库可解码的 png/jpg/jpeg（webp/bmp 请先转格式）
 	importableExt := map[string]bool{".png": true, ".jpg": true, ".jpeg": true}
+	var totalBytes int64
 	for _, fh := range files {
 		ext := strings.ToLower(filepath.Ext(fh.Filename))
 		if !importableExt[ext] {
@@ -106,6 +107,13 @@ func ImportPNGSet(cfg *config.Config, files []*multipart.FileHeader) (string, []
 		if fh.Size <= 0 || fh.Size > maxUploadBytes {
 			return "", nil, fmt.Errorf("文件 %s 大小超出限制（最多 %d MB）", fh.Filename, maxUploadBytes>>20)
 		}
+		totalBytes += fh.Size
+	}
+	// 聚合总量与 PSD 导入对齐：单文件虽 ≤25MB，但 200 个文件的 multipart
+	// 信封可达数 GB，必须封顶，防止磁盘/内存被单请求打满。
+	if totalBytes > 500<<20 {
+		return "", nil, fmt.Errorf("批量导入总量超出限制（累计最多 500MB，当前约 %dMB）",
+			totalBytes>>20)
 	}
 	dir := filepath.Join(cfg.Output.BaseDir, fmt.Sprintf("png_import_%d", time.Now().Unix()))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -125,6 +133,15 @@ func ImportPNGSet(cfg *config.Config, files []*multipart.FileHeader) (string, []
 		src, err := fh.Open()
 		if err != nil {
 			return "", nil, fmt.Errorf("读取上传文件失败: %v", err)
+		}
+		// 先只解析文件头做像素边界检查（防解压炸弹），通过后回到流首完整解码。
+		if err := rejectOversizedImageConfig(src); err != nil {
+			src.Close()
+			return "", nil, fmt.Errorf("文件 %s 无法导入: %v", fh.Filename, err)
+		}
+		if _, err := src.Seek(0, io.SeekStart); err != nil {
+			src.Close()
+			return "", nil, fmt.Errorf("文件 %s 读取失败: %v", fh.Filename, err)
 		}
 		img, err := decodeImageReader(src)
 		src.Close()

@@ -87,9 +87,12 @@ func main() {
 	// Gzip 压缩中间件（提升响应速度）
 	r.Use(gzip.Gzip(gzip.DefaultCompression))
 
-	// 请求体大小限制中间件
+	// 请求体大小限制中间件（按路由区分：JSON 默认 10MB；上传 25MB；
+	// PSD 导入与 PNG 批量导入 500MB。全局统一 10MB 会让大文件上传必然失败）
 	r.Use(func(c *gin.Context) {
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cfg.Server.MaxRequestBodySize)
+		c.Request.Body = http.MaxBytesReader(
+			c.Writer, c.Request.Body, requestBodyLimit(cfg, c.Request.URL.Path),
+		)
 		c.Next()
 	})
 
@@ -482,6 +485,20 @@ func allowedHostMiddleware(allowed map[string]struct{}) gin.HandlerFunc {
 			return
 		}
 		c.Next()
+	}
+}
+
+// requestBodyLimit 按路由返回请求体字节上限。
+// 默认 JSON 接口用配置的 10MB；multipart 上传按业务承诺放宽：
+// 单图上传 25MB，PSD 与 PNG 批量导入 500MB（批量另有聚合总量校验）。
+func requestBodyLimit(cfg *config.Config, urlPath string) int64 {
+	switch {
+	case strings.HasSuffix(urlPath, "/import/psd"), strings.HasSuffix(urlPath, "/import/pngs"):
+		return 500 << 20
+	case strings.HasSuffix(urlPath, "/upload"):
+		return 25 << 20
+	default:
+		return cfg.Server.MaxRequestBodySize
 	}
 }
 

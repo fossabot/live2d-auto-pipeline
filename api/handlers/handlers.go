@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -279,16 +280,20 @@ func (h *Handler) CreatePSDPlan(c *gin.Context) {
 		return
 	}
 
-	result, err := h.pythonBridge.CreatePSDPlan(req.ImagePath)
+	result, err := h.pythonBridge.CreatePSDPlan(c.Request.Context(), req.ImagePath)
 	if err != nil {
-		if errors.Is(err, services.ErrPathOutsideBase) {
+		switch {
+		case errors.Is(err, services.ErrPathOutsideBase):
 			c.JSON(http.StatusBadRequest, models.Response{
 				Success: false,
 				Error:   err.Error(),
 			})
-			return
+		case errors.Is(err, services.ErrPythonTimeout):
+			// CPU 语义分层可能耗时数分钟，超时与 segment 一样走 504 契约
+			c.JSON(http.StatusGatewayTimeout, models.Response{Success: false, Error: err.Error()})
+		default:
+			h.serverError(c, "PSD分层", err)
 		}
-		h.serverError(c, "PSD分层", err)
 		return
 	}
 
@@ -465,7 +470,7 @@ func (h *Handler) SegmentImage(c *gin.Context) {
 		imagePath = filepath.Join(h.cfg.Output.BaseDir, imagePath)
 	}
 
-	result, err := h.pythonBridge.SegmentImage(imagePath, req.Method)
+	result, err := h.pythonBridge.SegmentImage(c.Request.Context(), imagePath, req.Method)
 	if err != nil {
 		switch {
 		case errors.Is(err, services.ErrPathOutsideBase):
@@ -534,7 +539,7 @@ func (h *Handler) AddCharacterReference(c *gin.Context) {
 		return
 	}
 	// embedding 提取尽力而为：失败时参考图路径已在卡上，前端可稍后重算
-	embedErr := h.pythonBridge.AddReferenceImage(characterID, req.ImagePath, req.View)
+	embedErr := h.pythonBridge.AddReferenceImage(c.Request.Context(), characterID, req.ImagePath, req.View)
 	data := gin.H{"card": card, "embedding_extracted": embedErr == nil}
 	if embedErr != nil {
 		data["embedding_note"] = "参考图已登记，但 embedding 提取失败（可稍后重算）"
@@ -549,7 +554,7 @@ func (h *Handler) RecomputeCharacterEmbedding(c *gin.Context) {
 		c.JSON(http.StatusNotFound, models.Response{Success: false, Error: err.Error()})
 		return
 	}
-	result, err := h.pythonBridge.RecomputeCharacterEmbedding(characterID)
+	result, err := h.pythonBridge.RecomputeCharacterEmbedding(c.Request.Context(), characterID)
 	if err != nil {
 		if errors.Is(err, services.ErrPythonTimeout) {
 			c.JSON(http.StatusGatewayTimeout, models.Response{Success: false, Error: err.Error()})
@@ -568,7 +573,7 @@ func (h *Handler) RecomputeCharacterEmbedding(c *gin.Context) {
 // ListImageProviders 报告图像生成的上游路由状态：哪些 provider 已配置可用、
 // 哪些已注册但缺 Key。前端生成页据此展示可选项，避免选中后才发现没 Key。
 func (h *Handler) ListImageProviders(c *gin.Context) {
-	available, registered, err := h.pythonBridge.ListImageProviders()
+	available, registered, err := h.pythonBridge.ListImageProviders(c.Request.Context())
 	if err != nil {
 		// 查询失败不阻塞前端：给前端固定的业务状态，错误详情（可能含本机
 		// 路径/上游原文）只记日志，不随响应体下发。
@@ -619,7 +624,7 @@ func (h *Handler) ImportPSD(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.Response{Success: false, Error: err.Error()})
 		return
 	}
-	result, err := h.pythonBridge.ImportPSDLayers(path)
+	result, err := h.pythonBridge.ImportPSDLayers(c.Request.Context(), path)
 	if err != nil {
 		if errors.Is(err, services.ErrPythonTimeout) {
 			c.JSON(http.StatusGatewayTimeout, models.Response{Success: false, Error: err.Error()})
@@ -931,7 +936,7 @@ func (h *Handler) ExportLive2D(c *gin.Context) {
 
 	// Zip download mode (used by the web preview's Export button).
 	if req.Download {
-		modelDir, err := h.resolveExportModelDir(req)
+		modelDir, err := h.resolveExportModelDir(c.Request.Context(), req)
 		if err != nil {
 			if errors.Is(err, services.ErrPythonTimeout) {
 				h.exportFailureResponse(c, err)
@@ -956,7 +961,7 @@ func (h *Handler) ExportLive2D(c *gin.Context) {
 	}
 
 	// JSON mode (backward compatible).
-	result, err := h.exportLive2DModelTracked(req.CharacterID, req.LayersDir, req.OutputDir)
+	result, err := h.exportLive2DModelTracked(c.Request.Context(), req.CharacterID, req.LayersDir, req.OutputDir)
 	if err != nil {
 		h.exportFailureResponse(c, err)
 		return
@@ -1045,7 +1050,7 @@ func stringField(values map[string]interface{}, key string) string {
 // Precedence:
 //  1. An explicit model_dir (resolved under Output.BaseDir, traversal-safe).
 //  2. A fresh export via the Python bridge; its output_dir is used.
-func (h *Handler) resolveExportModelDir(req models.ExportModelRequest) (string, error) {
+func (h *Handler) resolveExportModelDir(ctx context.Context, req models.ExportModelRequest) (string, error) {
 	if req.ModelDir != "" {
 		candidate := req.ModelDir
 		if !filepath.IsAbs(candidate) {
@@ -1062,7 +1067,7 @@ func (h *Handler) resolveExportModelDir(req models.ExportModelRequest) (string, 
 		return candidate, nil
 	}
 
-	result, err := h.exportLive2DModelTracked(req.CharacterID, req.LayersDir, req.OutputDir)
+	result, err := h.exportLive2DModelTracked(ctx, req.CharacterID, req.LayersDir, req.OutputDir)
 	if err != nil {
 		return "", err
 	}
@@ -1083,13 +1088,16 @@ func (h *Handler) ExportPSD(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.Response{Success: false, Error: "参数错误: " + err.Error()})
 		return
 	}
-	result, err := h.pythonBridge.CreatePSDPlan(req.ImagePath)
+	result, err := h.pythonBridge.CreatePSDPlan(c.Request.Context(), req.ImagePath)
 	if err != nil {
-		if errors.Is(err, services.ErrPathOutsideBase) {
+		switch {
+		case errors.Is(err, services.ErrPathOutsideBase):
 			c.JSON(http.StatusBadRequest, models.Response{Success: false, Error: err.Error()})
-			return
+		case errors.Is(err, services.ErrPythonTimeout):
+			c.JSON(http.StatusGatewayTimeout, models.Response{Success: false, Error: err.Error()})
+		default:
+			h.serverError(c, "PSD导出", err)
 		}
-		h.serverError(c, "PSD导出", err)
 		return
 	}
 	c.JSON(http.StatusOK, models.Response{Success: true, Message: "PSD导出成功", Data: result})
@@ -1120,7 +1128,7 @@ func (h *Handler) DeployDesktop(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.Response{Success: false, Message: "需要提供真实导出模型的 model_dir"})
 		return
 	}
-	result, err := h.pythonBridge.DeployDesktopModel(req.ModelDir)
+	result, err := h.pythonBridge.DeployDesktopModel(c.Request.Context(), req.ModelDir)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, models.Response{Success: false, Message: err.Error(), Data: map[string]interface{}{"deployed": false, "runtime_verified": false}})
 		return

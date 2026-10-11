@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -185,7 +186,7 @@ func TestValidatePath_RejectsShellInjection_EndToEnd(t *testing.T) {
 
 	t.Run("SegmentImage_路径注入", func(t *testing.T) {
 		malicious := "output/file;rm -rf /"
-		_, err := pb.SegmentImage(malicious, "kmeans")
+		_, err := pb.SegmentImage(context.Background(), malicious, "kmeans")
 		if err == nil {
 			t.Fatal("SegmentImage 应在 validatePath 阶段拒绝 shell 注入路径")
 		}
@@ -196,7 +197,7 @@ func TestValidatePath_RejectsShellInjection_EndToEnd(t *testing.T) {
 
 	t.Run("ImportPSDLayers_路径注入", func(t *testing.T) {
 		malicious := "output/x`whoami`"
-		_, err := pb.ImportPSDLayers(malicious)
+		_, err := pb.ImportPSDLayers(context.Background(), malicious)
 		if err == nil {
 			t.Fatal("ImportPSDLayers 应拒绝含反引号的路径")
 		}
@@ -216,7 +217,7 @@ func TestValidateStrictID_RejectsShellInjection_EndToEnd(t *testing.T) {
 	}
 	for _, id := range maliciousIDs {
 		t.Run(id, func(t *testing.T) {
-			err := pb.AddReferenceImage(id, "output/x.png", "front")
+			err := pb.AddReferenceImage(context.Background(), id, "output/x.png", "front")
 			if err == nil {
 				t.Fatalf("AddReferenceImage 应拒绝注入型 ID: %q", id)
 			}

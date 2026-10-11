@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -69,13 +70,13 @@ func stageMessage(evt services.StageEvent) string {
 //
 // 返回值与 pythonBridge.ExportLive2DModel 一致（含错误类型），因此
 // exportFailureResponse / exportResponseData 的行为不受影响。
-func (h *Handler) exportLive2DModelTracked(characterID, layersDir,
+func (h *Handler) exportLive2DModelTracked(ctx context.Context, characterID, layersDir,
 	outputDir string) (map[string]interface{}, error) {
 	reporter := h.newExportStageReporter()
 	if reporter == nil {
-		return h.pythonBridge.ExportLive2DModel(characterID, layersDir, outputDir)
+		return h.pythonBridge.ExportLive2DModel(ctx, characterID, layersDir, outputDir)
 	}
-	result, err := h.pythonBridge.ExportLive2DModelTracked(characterID, layersDir,
+	result, err := h.pythonBridge.ExportLive2DModelTracked(ctx, characterID, layersDir,
 		outputDir, reporter.tracker)
 	reporter.finish(result, err)
 	return result, err

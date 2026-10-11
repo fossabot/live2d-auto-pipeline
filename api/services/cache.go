@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"live2d-api/config"
@@ -26,8 +27,10 @@ type RequestCache struct {
 	maxSizeMB     int
 	currentSizeMB int
 	ttl           time.Duration
-	hitCount      int64
-	missCount     int64
+	// 计数器在 Get（RLock 并发路径）上自增，必须用原子类型，
+	// 不能在 RLock 保护下做普通 ++（确定性 data race）。
+	hitCount  atomic.Int64
+	missCount atomic.Int64
 }
 
 // NewRequestCache 创建新的缓存服务
@@ -38,8 +41,6 @@ func NewRequestCache(cfg config.CacheConfig) *RequestCache {
 		maxSizeMB:     cfg.MaxSizeMB,
 		currentSizeMB: 0,
 		ttl:           time.Duration(cfg.TTLSeconds) * time.Second,
-		hitCount:      0,
-		missCount:     0,
 	}
 }
 
@@ -57,20 +58,22 @@ func (c *RequestCache) Get(prompt string, width, height, seed int, modelID strin
 
 	key := c.generateKey(prompt, width, height, seed, modelID)
 	entry, exists := c.cache[key]
-	
+
 	if !exists {
-		c.missCount++
+		c.missCount.Add(1)
 		return nil, false
 	}
 
 	// 检查是否过期
 	if time.Since(entry.Created) > c.ttl {
-		c.missCount++
+		c.missCount.Add(1)
 		return nil, false
 	}
 
-	entry.Accesses++
-	c.hitCount++
+	// 注意：不要在这里自增 entry.Accesses——Get 只持有 RLock，
+	// 多个读者并发写字段就是 data race。Accesses 当前无消费方，
+	// 仅在 Set 创建条目时置 1。
+	c.hitCount.Add(1)
 	return entry.Response, true
 }
 
@@ -80,9 +83,15 @@ func (c *RequestCache) Set(prompt string, width, height, seed int, modelID strin
 	defer c.mu.Unlock()
 
 	key := c.generateKey(prompt, width, height, seed, modelID)
-	
+
 	// 计算条目大小（粗略估算）
 	entrySizeMB := estimateSizeMB(response)
+
+	// 覆盖同 key 时先回收旧条目容量，否则记账只增不减（容量漂移）
+	if old, ok := c.cache[key]; ok {
+		c.currentSizeMB -= estimateSizeMB(old.Response)
+		delete(c.cache, key)
+	}
 
 	// 如果超出限制，先清理
 	for c.currentSizeMB+entrySizeMB > c.maxSizeMB && len(c.cache) > 0 {
@@ -155,8 +164,8 @@ func (c *RequestCache) Clear() {
 	defer c.mu.Unlock()
 	c.cache = make(map[string]*CacheEntry)
 	c.currentSizeMB = 0
-	c.hitCount = 0
-	c.missCount = 0
+	c.hitCount.Store(0)
+	c.missCount.Store(0)
 }
 
 // Stats 获取缓存统计
@@ -164,23 +173,25 @@ func (c *RequestCache) Stats() map[string]interface{} {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	total := c.hitCount + c.missCount
+	hits := c.hitCount.Load()
+	misses := c.missCount.Load()
+	total := hits + misses
 	hitRate := 0.0
 	if total > 0 {
-		hitRate = float64(c.hitCount) / float64(total) * 100
+		hitRate = float64(hits) / float64(total) * 100
 	}
 
 	return map[string]interface{}{
-		"entries":       len(c.cache),
+		"entries":         len(c.cache),
 		"current_size_mb": c.currentSizeMB,
-		"max_size_mb":   c.maxSizeMB,
-		"hit_count":     c.hitCount,
-		"miss_count":    c.missCount,
-		"hit_rate":      fmt.Sprintf("%.2f%%", hitRate),
+		"max_size_mb":     c.maxSizeMB,
+		"hit_count":       hits,
+		"miss_count":      misses,
+		"hit_rate":        fmt.Sprintf("%.2f%%", hitRate),
 	}
 }
 
-// PurgeExpired 清除过期缓存
+// PurgeExpired 清除过期缓存并同步回收容量记账
 func (c *RequestCache) PurgeExpired() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -188,8 +199,12 @@ func (c *RequestCache) PurgeExpired() {
 	now := time.Now()
 	for key, entry := range c.cache {
 		if now.Sub(entry.Created) > c.ttl {
+			c.currentSizeMB -= estimateSizeMB(entry.Response)
 			delete(c.cache, key)
 		}
+	}
+	if c.currentSizeMB < 0 {
+		c.currentSizeMB = 0
 	}
 }
 

@@ -8,6 +8,7 @@ package services
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -49,12 +50,12 @@ func TestSegmentImage_RejectsPathOutsideBase(t *testing.T) {
 
 	existing := filepath.Join(t.TempDir(), "secret.png")
 	writeFile(t, existing)
-	if _, err := pb.SegmentImage(existing, "kmeans"); !errors.Is(err, ErrPathOutsideBase) {
+	if _, err := pb.SegmentImage(context.Background(), existing, "kmeans"); !errors.Is(err, ErrPathOutsideBase) {
 		t.Fatalf("根外存在文件应被归属校验拒绝，实得 %v", err)
 	}
 
 	missing := filepath.Join(t.TempDir(), "nope.png")
-	if _, err := pb.SegmentImage(missing, "kmeans"); !errors.Is(err, ErrPathOutsideBase) {
+	if _, err := pb.SegmentImage(context.Background(), missing, "kmeans"); !errors.Is(err, ErrPathOutsideBase) {
 		t.Fatalf("根外不存在的路径也应被归属校验拒绝（避免存在性 oracle），实得 %v", err)
 	}
 }
@@ -64,7 +65,7 @@ func TestCreatePSDPlan_RejectsPathOutsideBase(t *testing.T) {
 
 	outside := filepath.Join(t.TempDir(), "secret.png")
 	writeFile(t, outside)
-	if _, err := pb.CreatePSDPlan(outside); !errors.Is(err, ErrPathOutsideBase) {
+	if _, err := pb.CreatePSDPlan(context.Background(), outside); !errors.Is(err, ErrPathOutsideBase) {
 		t.Fatalf("PSD 规划应拒绝根外源图，实得 %v", err)
 	}
 }
@@ -76,10 +77,10 @@ func TestSourceImageInsideBaseIsNotOverBlocked(t *testing.T) {
 	inside := filepath.Join(base, "uploads", "src.png")
 	writeFile(t, inside)
 
-	if _, err := pb.SegmentImage(inside, "kmeans"); errors.Is(err, ErrPathOutsideBase) {
+	if _, err := pb.SegmentImage(context.Background(), inside, "kmeans"); errors.Is(err, ErrPathOutsideBase) {
 		t.Fatalf("输出根内上传图被误伤: %v", err)
 	}
-	if _, err := pb.CreatePSDPlan(inside); errors.Is(err, ErrPathOutsideBase) {
+	if _, err := pb.CreatePSDPlan(context.Background(), inside); errors.Is(err, ErrPathOutsideBase) {
 		t.Fatalf("输出根内上传图被 PSD 规划误伤: %v", err)
 	}
 }
@@ -154,5 +155,78 @@ func TestWSHandshakeRejectsNonUpgrade(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("非 Upgrade 请求应 400，实得 %d", resp.StatusCode)
+	}
+}
+
+// wsDialAndHold 完成 WS 握手并保持连接打开（返回连接与首行状态）。
+func wsDialAndHold(t *testing.T, addr string) (net.Conn, string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("拨号失败: %v", err)
+	}
+	req := "GET /api/ws HTTP/1.1\r\n" +
+		"Host: localhost:8080\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+	if _, err := fmt.Fprint(conn, req); err != nil {
+		conn.Close()
+		t.Fatalf("发送握手失败: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		conn.Close()
+		t.Fatalf("读取握手响应失败: %v", err)
+	}
+	return conn, line
+}
+
+// M7：连接数上限必须在 hijack/101 之前以普通 HTTP 503 拒绝，且连接断开后
+// 槽位立即释放，后续合法连接不受影响（攻击拦截 + 合法路径放行双向验证）。
+func TestWSHandshakeConnectionCapRejectedBeforeUpgrade(t *testing.T) {
+	hub := NewWSHubWithOrigins(nil, 8080)
+	hub.SetMaxConns(1)
+	go hub.Run()
+	srv := httptest.NewServer(http.HandlerFunc(hub.HandleUpgrade))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	// 第一条合法连接占住唯一槽位（101 升级成功）
+	first, line := wsDialAndHold(t, addr)
+	if !strings.Contains(line, "101") {
+		first.Close()
+		t.Fatalf("首条合法连接应升级成功，实得 %q", line)
+	}
+	if hub.ActiveConns() != 1 {
+		t.Fatalf("占槽计数应为 1，实得 %d", hub.ActiveConns())
+	}
+
+	// 第二条连接必须在握手阶段被 503 拒绝（拿不到 101）
+	if status := wsHandshakeStatus(t, addr, ""); !strings.Contains(status, "503") {
+		t.Errorf("超上限连接应在 hijack 前返回 503，实得 %q", status)
+	}
+	// 被拒连接不得占用槽位
+	if hub.ActiveConns() != 1 {
+		t.Errorf("拒绝的连接不应占槽，实得 %d", hub.ActiveConns())
+	}
+
+	// 第一条断开后槽位必须释放（readPump 读到 EOF 即退出）
+	first.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for hub.ActiveConns() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if hub.ActiveConns() != 0 {
+		t.Fatalf("断开后槽位未释放，仍有 %d 个连接", hub.ActiveConns())
+	}
+
+	// 释放后新的合法连接必须能正常升级
+	third, line := wsDialAndHold(t, addr)
+	defer third.Close()
+	if !strings.Contains(line, "101") {
+		t.Errorf("槽位释放后合法连接应能升级，实得 %q", line)
 	}
 }

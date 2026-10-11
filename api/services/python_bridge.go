@@ -87,21 +87,36 @@ func validatePath(path string) error {
 	return nil
 }
 
-// executePythonScript safely executes a Python script with configurable timeout
-func (pb *PythonBridge) executePythonScript(scriptPath string, args []string, timeout time.Duration) ([]byte, error) {
-	if err := validatePath(scriptPath); err != nil {
-		return nil, fmt.Errorf("脚本路径验证失败: %v", err)
+// executePythonScript safely executes a Python script with a timeout.
+//
+// argv 是完整的 Python 参数列表（脚本路径或 -c 代码等），scriptPath 安全
+// 校验仅对「非选项开头」的 argv[0] 生效。
+//
+// parent ctx 通常是 *http.Request 的 context：客户端断连会取消 ctx，
+// 此时必须杀掉整个 Python 进程组（configurePythonProcess 建的新进程组，
+// 含 workflow 派生的孙子进程），否则孙子进程会带着继承的 stdout 管道
+// 继续空跑并让 CombinedOutput/Wait 永不阻塞。
+func (pb *PythonBridge) executePythonScript(parent context.Context, argv []string, timeout time.Duration) ([]byte, error) {
+	if parent == nil {
+		parent = context.Background()
 	}
-	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("脚本不存在: %s", scriptPath)
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("缺少 Python 执行参数")
+	}
+	// argv[0] 是脚本路径时保留纵深防御校验；-c/-m 等选项开头无可 stat 路径。
+	if scriptPath := argv[0]; !strings.HasPrefix(scriptPath, "-") {
+		if err := validatePath(scriptPath); err != nil {
+			return nil, fmt.Errorf("脚本路径验证失败: %v", err)
+		}
+		if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+			return nil, fmt.Errorf("脚本不存在: %s", scriptPath)
+		}
 	}
 
-	fullArgs := append([]string{scriptPath}, args...)
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, pb.cfg.Python.PythonPath, fullArgs...)
+	cmd := exec.CommandContext(ctx, pb.cfg.Python.PythonPath, argv...)
 	cmd.Dir = pb.cfg.Python.ScriptsDir
 
 	cmd.Env = append(os.Environ(),
@@ -126,13 +141,26 @@ func (pb *PythonBridge) executePythonScript(scriptPath string, args []string, ti
 	}
 
 	configurePythonProcess(cmd)
+	// ctx 取消（客户端断连）或超时时杀掉**整个进程组**（含 workflow 派生的
+	// 孙子进程）。Go 默认的 CommandContext 只杀直接子进程；孙子进程会继续
+	// 攥着继承的 stdout 管道，导致 CombinedOutput 永不返回、GPU/CPU 空转。
+	cmd.Cancel = func() error {
+		killPythonProcess(cmd)
+		return os.ErrProcessDone
+	}
+	// 兜底：杀组后若仍有野进程占着管道，WaitDelay 到点强制关闭 IO，
+	// 保证调用一定能返回、goroutine 不泄漏。
+	cmd.WaitDelay = 5 * time.Second
 
 	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		if cmd.Process != nil {
-			killPythonProcess(cmd)
-		}
-		return nil, fmt.Errorf("脚本执行超时（限制%d秒）", int(timeout.Seconds()))
+	switch {
+	case ctx.Err() == context.DeadlineExceeded:
+		// 必须包装 ErrPythonTimeout：handler 层据此返回契约规定的 504，
+		// 否则 segment/PSD 导入/embedding 的 504 分支永远走不到（误报 500）。
+		return nil, fmt.Errorf("%w（脚本执行超时，限制%d秒）", ErrPythonTimeout, int(timeout.Seconds()))
+	case ctx.Err() == context.Canceled:
+		// 父 ctx（请求）取消：进程组已被 cmd.Cancel 清掉，返回可识别的取消错误。
+		return nil, fmt.Errorf("Python 任务已取消: %w", context.Canceled)
 	}
 	if err != nil {
 		sanitizedOutput := sanitizeOutput(string(output))
@@ -187,7 +215,8 @@ func (pb *PythonBridge) GenerateImageViaPython(prompt string, width, height, see
 	}
 
 	timeout := pb.cfg.GetPythonTimeout() * 3
-	output, err := pb.executePythonScript(scriptPath, args, timeout)
+	output, err := pb.executePythonScript(context.Background(),
+		append([]string{scriptPath}, args...), timeout)
 	if err != nil {
 		return "", err
 	}
@@ -225,7 +254,7 @@ func (pb *PythonBridge) GenerateImageViaPython(prompt string, width, height, see
 
 // CreatePSDPlan creates PSD layer plan using the core segment engine
 // v0.10.1: Uses the same KMeans/semantic pipeline as workflow, returns PSD path
-func (pb *PythonBridge) CreatePSDPlan(imagePath string) (*models.PSDLayerResponse, error) {
+func (pb *PythonBridge) CreatePSDPlan(ctx context.Context, imagePath string) (*models.PSDLayerResponse, error) {
 	if err := validatePath(imagePath); err != nil {
 		return nil, fmt.Errorf("路径验证失败: %v", err)
 	}
@@ -269,7 +298,7 @@ print(json.dumps({
 }, ensure_ascii=False))
 `, pb.cfg.Python.ScriptsDir, imagePath, outputDir)
 
-	result, err := pb.runInlinePython(pyCode)
+	result, err := pb.runInlinePython(ctx, pyCode)
 	if err != nil {
 		return nil, err
 	}
@@ -340,8 +369,11 @@ func (pb *PythonBridge) RunSeeThroughWorkflow(imagePath string) (*models.SeeThro
 // 安全设计：任务脚本是**不含任何外部输入的常量**，参数经 JSON 文件
 // 从 sys.argv[1] 读取 —— 源码字符串零拼接，从根源上消除注入面。
 // 返回 stdout 最后一个可解析的 JSON 对象（与 runInlinePython 同契约）。
-func (pb *PythonBridge) runBridgeTask(script string,
+func (pb *PythonBridge) runBridgeTask(parent context.Context, script string,
 	params map[string]interface{}, timeout time.Duration) (map[string]interface{}, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	tmpDir, err := os.MkdirTemp("", "live2d_bridge_")
 	if err != nil {
 		return nil, fmt.Errorf("创建桥接临时目录失败: %v", err)
@@ -361,8 +393,11 @@ func (pb *PythonBridge) runBridgeTask(script string,
 		return nil, fmt.Errorf("写入桥接脚本失败: %v", err)
 	}
 
-	output, err := pb.executePythonScript(scriptPath, []string{paramsPath}, timeout)
+	output, err := pb.executePythonScript(parent,
+		[]string{scriptPath, paramsPath}, timeout)
 	if err != nil {
+		// 原样透传：ErrPythonTimeout / 取消错误必须保留 errors.Is 可判定性，
+		// handler 层据此回 504，M3 要求超时不能在这里被吞成普通 500。
 		return nil, err
 	}
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
@@ -391,14 +426,14 @@ print(json.dumps({"ref_path": path}))
 `
 
 // AddReferenceImage 添加参考图并提取 embedding
-func (pb *PythonBridge) AddReferenceImage(characterID, imagePath, view string) error {
+func (pb *PythonBridge) AddReferenceImage(ctx context.Context, characterID, imagePath, view string) error {
 	if err := validateStrictID(characterID); err != nil {
 		return err
 	}
 	if view == "" {
 		view = "front"
 	}
-	_, err := pb.runBridgeTask(bridgeAddReferenceScript, map[string]interface{}{
+	_, err := pb.runBridgeTask(ctx, bridgeAddReferenceScript, map[string]interface{}{
 		"storage_dir":  pb.cfg.Character.StorageDir,
 		"character_id": characterID,
 		"image_path":   imagePath,
@@ -434,7 +469,7 @@ layers = [{"name": l.get("name", ""), "part_name": l.get("part_name", l.get("nam
 print(json.dumps({"method": result.get("method", method), "layers_dir": str(out_dir), "layers": layers, "composite_preview": result.get("composite_preview", "") or "", "psd_path": psd_result.get("psd_path", "") or "", "psd_success": bool(psd_result.get("success"))}))
 `
 
-func (pb *PythonBridge) SegmentImage(imagePath, method string) (map[string]interface{}, error) {
+func (pb *PythonBridge) SegmentImage(ctx context.Context, imagePath, method string) (map[string]interface{}, error) {
 	if err := validatePath(imagePath); err != nil {
 		return nil, err
 	}
@@ -452,7 +487,7 @@ func (pb *PythonBridge) SegmentImage(imagePath, method string) (map[string]inter
 	}
 	outDir := filepath.Join(pb.cfg.Output.BaseDir, fmt.Sprintf("layers_%d", time.Now().Unix()))
 	// 语义分割在 CPU 上可能耗时数分钟，预算给足
-	res, err := pb.runBridgeTask(bridgeSegmentScript, map[string]interface{}{
+	res, err := pb.runBridgeTask(ctx, bridgeSegmentScript, map[string]interface{}{
 		"image_path": imagePath,
 		"out_dir":    outDir,
 		"method":     method,
@@ -494,11 +529,11 @@ else:
 // RecomputeCharacterEmbedding 为角色重新提取视觉 embedding（CLIP 可用时用
 // CLIP，否则退化为直方图 embedding —— 由 core/character/embedding.py 决定）。
 // 返回 {has_embedding, dim, reason?}，让前端能如实展示降级情况。
-func (pb *PythonBridge) RecomputeCharacterEmbedding(characterID string) (map[string]interface{}, error) {
+func (pb *PythonBridge) RecomputeCharacterEmbedding(ctx context.Context, characterID string) (map[string]interface{}, error) {
 	if err := validateStrictID(characterID); err != nil {
 		return nil, err
 	}
-	res, err := pb.runBridgeTask(bridgeRecomputeEmbeddingScript, map[string]interface{}{
+	res, err := pb.runBridgeTask(ctx, bridgeRecomputeEmbeddingScript, map[string]interface{}{
 		"storage_dir":  pb.cfg.Character.StorageDir,
 		"character_id": characterID,
 	}, 10*time.Minute)
@@ -527,8 +562,8 @@ print(json.dumps({
 
 // ListImageProviders 查询 Python ProviderRouter 的上游生成服务状态：
 // 哪些已配置可用（含新接入的 openai 兼容端点）、哪些已注册但缺 Key。
-func (pb *PythonBridge) ListImageProviders() ([]map[string]interface{}, []string, error) {
-	res, err := pb.runBridgeTask(bridgeListProvidersScript, nil, 60*time.Second)
+func (pb *PythonBridge) ListImageProviders(ctx context.Context) ([]map[string]interface{}, []string, error) {
+	res, err := pb.runBridgeTask(ctx, bridgeListProvidersScript, nil, 60*time.Second)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -556,7 +591,7 @@ func (pb *PythonBridge) ListImageProviders() ([]map[string]interface{}, []string
 // ImportPSDLayers 用 psd-tools 把外部 PSD 的每个像素图层按原始坐标
 // 合成为整幅画布 RGBA PNG（底层在前、前景在后），供分层工作台直接
 // 预览与后续 Live2D 导出使用。
-func (pb *PythonBridge) ImportPSDLayers(psdPath string) (map[string]interface{}, error) {
+func (pb *PythonBridge) ImportPSDLayers(ctx context.Context, psdPath string) (map[string]interface{}, error) {
 	if err := validatePath(psdPath); err != nil {
 		return nil, err
 	}
@@ -565,7 +600,7 @@ func (pb *PythonBridge) ImportPSDLayers(psdPath string) (map[string]interface{},
 	}
 	outDir := filepath.Join(pb.cfg.Output.BaseDir, fmt.Sprintf("psd_import_%d", time.Now().Unix()))
 	// psd-tools 逐层导出在超大 PSD 上可能较慢，预算给足
-	res, err := pb.runBridgeTask(bridgeImportPSDScript, map[string]interface{}{
+	res, err := pb.runBridgeTask(ctx, bridgeImportPSDScript, map[string]interface{}{
 		"psd_path": psdPath,
 		"out_dir":  outDir,
 	}, 10*time.Minute)
@@ -653,7 +688,7 @@ print(json.dumps({
 `
 
 // ExportLive2DModel 导出 Live2D 模型
-func (pb *PythonBridge) ExportLive2DModel(characterID, layersDir, outputDir string) (map[string]interface{}, error) {
+func (pb *PythonBridge) ExportLive2DModel(ctx context.Context, characterID, layersDir, outputDir string) (map[string]interface{}, error) {
 	if err := validateStrictID(characterID); err != nil {
 		return nil, err
 	}
@@ -676,7 +711,7 @@ func (pb *PythonBridge) ExportLive2DModel(characterID, layersDir, outputDir stri
 	}
 	// 完整导出要走网格生成 + 图集烘焙 + 官方内核验收，用独立预算
 	// （实测规模见 tools/measure_export_duration.py 与 config.GetExportTimeout）。
-	return pb.runBridgeTask(bridgeExportLive2DScript, map[string]interface{}{
+	return pb.runBridgeTask(ctx, bridgeExportLive2DScript, map[string]interface{}{
 		"layers_dir":   layersDir,
 		"out_dir":      outputDir,
 		"character_id": characterID,
@@ -723,15 +758,19 @@ print(json.dumps(summary, ensure_ascii=False, default=str))
 `
 
 // runInlinePython 执行内联 Python 代码
-func (pb *PythonBridge) runInlinePython(code string) (map[string]interface{}, error) {
-	return pb.runInlinePythonTimeout(code, pb.cfg.GetPythonTimeout())
+func (pb *PythonBridge) runInlinePython(ctx context.Context, code string) (map[string]interface{}, error) {
+	return pb.runInlinePythonTimeout(ctx, code, pb.cfg.GetPythonTimeout())
 }
 
 // runInlinePythonTimeout 用给定预算执行内联 Python。
-// 超时返回包装了 ErrPythonTimeout 的错误，调用方据此区分「慢」与「坏」。
-func (pb *PythonBridge) runInlinePythonTimeout(code string,
+// 超时返回包装了 ErrPythonTimeout 的错误，调用方据此区分「慢」与「坏」；
+// 父 ctx（请求）取消时杀掉整个进程组并返回取消错误。
+func (pb *PythonBridge) runInlinePythonTimeout(parent context.Context, code string,
 	timeout time.Duration) (map[string]interface{}, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, pb.cfg.Python.PythonPath, "-c", code)
@@ -742,14 +781,20 @@ func (pb *PythonBridge) runInlinePythonTimeout(code string,
 	)
 
 	configurePythonProcess(cmd)
+	// 与 executePythonScript 同一套组灭杀语义（H4）。
+	cmd.Cancel = func() error {
+		killPythonProcess(cmd)
+		return os.ErrProcessDone
+	}
+	cmd.WaitDelay = 5 * time.Second
 
 	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		if cmd.Process != nil {
-			killPythonProcess(cmd)
-		}
+	switch {
+	case ctx.Err() == context.DeadlineExceeded:
 		return nil, fmt.Errorf("%w（%s）: Python执行超时",
 			ErrPythonTimeout, timeout)
+	case ctx.Err() == context.Canceled:
+		return nil, fmt.Errorf("Python 任务已取消: %w", context.Canceled)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("Python执行失败: %v\n%s", err, sanitizeOutput(string(output)))

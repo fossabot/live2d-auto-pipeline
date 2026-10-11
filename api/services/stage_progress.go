@@ -362,9 +362,12 @@ func scanStageLines(r io.Reader, tracker *StageTracker) string {
 
 // runInlinePythonStreaming 是 runInlinePythonTimeout 的实时版：同一份预算语义、
 // 同一份返回结构（{"result": ...}）、同一份错误文本，只是多了一个 tracker。
-func (pb *PythonBridge) runInlinePythonStreaming(code string,
+func (pb *PythonBridge) runInlinePythonStreaming(parent context.Context, code string,
 	timeout time.Duration, tracker *StageTracker) (map[string]interface{}, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, pb.cfg.Python.PythonPath, "-c", code)
@@ -378,6 +381,13 @@ func (pb *PythonBridge) runInlinePythonStreaming(code string,
 	)
 
 	configurePythonProcess(cmd)
+	// H4：与 executePythonScript 同一套进程组灭杀 + 管道兜底，
+	// 客户端断连时连孙子进程一起收掉。
+	cmd.Cancel = func() error {
+		killPythonProcess(cmd)
+		return os.ErrProcessDone
+	}
+	cmd.WaitDelay = 5 * time.Second
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -417,8 +427,14 @@ func (pb *PythonBridge) runInlinePythonStreaming(code string,
 			killPythonProcess(cmd)
 		}
 		<-waited
-		tracker.Abort(fmt.Sprintf("构建在 %s 预算内没有完成", timeout))
-		return nil, fmt.Errorf("%w（%s）: Python执行超时", ErrPythonTimeout, timeout)
+		// 区分「预算耗尽」与「客户端断连/父任务取消」：前者保持 504 契约，
+		// 后者返回可识别的取消错误，避免误报超时。
+		if ctx.Err() == context.DeadlineExceeded {
+			tracker.Abort(fmt.Sprintf("构建在 %s 预算内没有完成", timeout))
+			return nil, fmt.Errorf("%w（%s）: Python执行超时", ErrPythonTimeout, timeout)
+		}
+		tracker.Abort("构建已取消")
+		return nil, fmt.Errorf("Python 任务已取消: %w", context.Canceled)
 	}
 
 	mu.Lock()
@@ -495,10 +511,10 @@ print(json.dumps(summary, ensure_ascii=False, default=str))
 // ExportLive2DModelTracked 导出 Live2D 模型，并把 log.step 边界作为阶段事件
 // 实时交给 tracker。tracker 为 nil 时完全退回 ExportLive2DModel 原路径
 // （同一份脚本、同一个执行函数），保证未启用进度通道时零行为差异。
-func (pb *PythonBridge) ExportLive2DModelTracked(characterID, layersDir, outputDir string,
+func (pb *PythonBridge) ExportLive2DModelTracked(ctx context.Context, characterID, layersDir, outputDir string,
 	tracker *StageTracker) (map[string]interface{}, error) {
 	if tracker == nil {
-		return pb.ExportLive2DModel(characterID, layersDir, outputDir)
+		return pb.ExportLive2DModel(ctx, characterID, layersDir, outputDir)
 	}
 	if err := validateStrictID(characterID); err != nil {
 		return nil, err
@@ -523,5 +539,5 @@ func (pb *PythonBridge) ExportLive2DModelTracked(characterID, layersDir, outputD
 	pyCode := exportStagePythonCode(pb.cfg.Python.ScriptsDir, layersDir, outputDir,
 		characterID, tracker.JobID())
 	// 与完整导出共用同一预算（实测规模见 tools/measure_export_duration.py）。
-	return pb.runInlinePythonStreaming(pyCode, pb.cfg.GetExportTimeout(), tracker)
+	return pb.runInlinePythonStreaming(ctx, pyCode, pb.cfg.GetExportTimeout(), tracker)
 }

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -86,7 +87,9 @@ func (s *CharacterService) CreateCharacter(req models.CharacterRequest) (*models
 			return nil, err
 		}
 		pb := NewPythonBridge(s.cfg)
-		_ = pb.AddReferenceImage(card.CharacterID, req.RefImage, "front")
+		// 建卡后的后台 embedding 提取：不属于任何单个 HTTP 请求，用独立
+		// 背景 ctx（自身仍有 Python 超时预算约束）。
+		_ = pb.AddReferenceImage(context.Background(), card.CharacterID, req.RefImage, "front")
 		// 重新加载以获取 embedding
 		if loaded, err := s.GetCharacter(card.CharacterID); err == nil {
 			card = loaded

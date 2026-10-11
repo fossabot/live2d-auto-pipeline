@@ -83,7 +83,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -726,8 +726,8 @@ async def delete_character(char_id: str):
 def _run_generate(req: "GenerateRequest") -> Dict[str, Any]:
     """同步执行单图生成（在线程池中调用，避免阻塞事件循环）。"""
     from core.image_gen.router import get_router
-    timestamp = int(time.time())
-    output_path = str(OUTPUT_DIR / f"generated_{timestamp}.png")
+    # M6：用 uuid 而非秒级时间戳命名，并发请求落在同一秒时不会互相覆盖产物。
+    output_path = str(OUTPUT_DIR / f"{generate_id('generated_')}.png")
     result = get_router().generate(
         prompt=req.prompt,
         output_path=output_path,
@@ -877,7 +877,8 @@ def _run_segment(req: "SegmentRequest") -> Dict[str, Any]:
     path = _resolve_segment_source(src)
 
     img = Image.open(path).convert("RGBA")
-    out_dir = OUTPUT_DIR / f"layers_{int(time.time())}"
+    # M6：uuid 命名，并发分层不再共享目录导致图层互相串台。
+    out_dir = OUTPUT_DIR / generate_id("layers_")
 
     if req.method == "kmeans":
         from core.segment_engine.kmeans import KMeansLayerer
@@ -1033,8 +1034,62 @@ def runtime_readiness(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ---------- M6：导出产物的唯一命名与陈旧清理 ----------
+# 旧导出目录保留 24h：既给预览页留足回看窗口，又避免无限堆积占满磁盘。
+EXPORT_ARTIFACT_TTL_SEC = 24 * 3600
+_EXPORT_SWEEP_LOCK = threading.Lock()
+
+
+def _safe_unlink(path: Path) -> None:
+    """发送后删除临时 zip；任何失败都不影响响应。"""
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _cleanup_old_export_artifacts() -> None:
+    """尽力清理 TTL 过期的 export_* 目录与系统临时目录中残留的下载 zip。
+
+    崩溃中断的下载会让临时 zip 泄漏，这里顺带扫；全程吞异常，清理永远不能
+    拖垮导出主链路。并发导出时用锁避免重复扫盘。
+    """
+    if not _EXPORT_SWEEP_LOCK.acquire(blocking=False):
+        return
+    try:
+        cutoff = time.time() - EXPORT_ARTIFACT_TTL_SEC
+        try:
+            for p in OUTPUT_DIR.glob("export_*"):
+                try:
+                    if p.is_dir() and p.stat().st_mtime < cutoff:
+                        shutil.rmtree(p, ignore_errors=True)
+                except Exception:
+                    continue
+            # 旧版本把下载 zip 直接写在输出根，遗留物同样按 TTL 清。
+            for p in OUTPUT_DIR.glob("live2d_*.zip"):
+                try:
+                    if p.is_file() and p.stat().st_mtime < cutoff:
+                        p.unlink()
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            tmp_dir = Path(tempfile.gettempdir())
+            for p in tmp_dir.glob("live2d_*.zip"):
+                try:
+                    if p.is_file() and p.stat().st_mtime < cutoff:
+                        p.unlink()
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    finally:
+        _EXPORT_SWEEP_LOCK.release()
+
+
 @app.post("/api/export/live2d")
-async def export_live2d(req: ExportLive2DRequest):
+async def export_live2d(req: ExportLive2DRequest, background_tasks: BackgroundTasks):
     try:
         source_dir = _resolve_export_source(req)
         if not source_dir:
@@ -1058,8 +1113,13 @@ async def export_live2d(req: ExportLive2DRequest):
             payload = {"success": False, "message": f"图层目录内没有可用 PNG：{source_dir}"}
             return ok(payload, "导出失败：图层为空")
 
-        export_dir = OUTPUT_DIR / f"export_{int(time.time())}"
+        # M6：uuid 命名导出目录，并发导出互不覆盖；顺手触发一次陈旧产物清理。
+        export_dir = OUTPUT_DIR / generate_id("export_")
         export_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            await asyncio.to_thread(_cleanup_old_export_artifacts)
+        except Exception:
+            pass
         try:
             result = await _to_thread_bounded(
                 _build_live2d_model,
@@ -1077,15 +1137,26 @@ async def export_live2d(req: ExportLive2DRequest):
         model3 = result.get("model3_json", "") or ""
         textures = [t for t in (result.get("textures") or []) if t]
 
-        # Live2D 预览页需要直接下载 ZIP 包
+        # Live2D 预览页需要直接下载 ZIP 包。
+        # M6：zip 写在系统临时目录（不落在可被 /output/ 直接访问的输出根），
+        # 用 mkstemp 拿到无碰撞路径；响应发送完成后立即删除，崩溃残留由
+        # _cleanup_old_export_artifacts 按 TTL 兜底回收。
         if req.download:
-            zip_path = OUTPUT_DIR / f"live2d_{int(time.time())}.zip"
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for f in export_dir.rglob("*"):
-                    if f.is_file():
-                        zf.write(f, f.relative_to(export_dir))
+            fd, tmp_name = tempfile.mkstemp(prefix="live2d_", suffix=".zip")
+            os.close(fd)
+            zip_path = Path(tmp_name)
+            try:
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for f in export_dir.rglob("*"):
+                        if f.is_file():
+                            zf.write(f, f.relative_to(export_dir))
+            except Exception:
+                _safe_unlink(zip_path)
+                raise
+            download_name = f"live2d_{generate_id()}.zip"
+            background_tasks.add_task(_safe_unlink, zip_path)
             return FileResponse(
-                str(zip_path), media_type="application/zip", filename=zip_path.name
+                str(zip_path), media_type="application/zip", filename=download_name
             )
 
         return ok({
@@ -1469,39 +1540,85 @@ async def ws_tracking(websocket: WebSocket):
         _TrackerState.release_ws_slot()
 
 
+class _GenericWSState:
+    """/api/ws 通用通道的全局连接计数（M7）。
+
+    与 _TrackerState 同样的考虑：页面脚本泄漏或恶意网页可以建立大量空闲
+    WebSocket，占满文件描述符与事件循环资源。上限必须在 accept 之前判定，
+    超额以 1013（Try Again Later）拒绝，浏览器拿不到已建立的连接。
+    可用 LIVE2D_WS_CLIENT_LIMIT 覆盖默认 100。
+    """
+
+    CLIENT_LIMIT = 100
+    _clients_lock = threading.Lock()
+    clients = 0
+
+    @classmethod
+    def _effective_limit(cls) -> int:
+        raw = os.environ.get("LIVE2D_WS_CLIENT_LIMIT", "").strip()
+        if not raw:
+            return cls.CLIENT_LIMIT
+        try:
+            val = int(raw)
+            return val if val > 0 else cls.CLIENT_LIMIT
+        except ValueError:
+            return cls.CLIENT_LIMIT
+
+    @classmethod
+    def acquire(cls) -> bool:
+        limit = cls._effective_limit()
+        with cls._clients_lock:
+            if cls.clients >= limit:
+                return False
+            cls.clients += 1
+            return True
+
+    @classmethod
+    def release(cls) -> None:
+        with cls._clients_lock:
+            cls.clients = max(0, cls.clients - 1)
+
+
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):
     # 与 /ws/tracking 同一道 Origin 闸门：跨站页面不得建立 WS 连接。
     if not _ws_origin_allowed(websocket):
         await websocket.close(code=1008)
         return
-    await websocket.accept()
+    # M7：accept 之前先占槽，超额直接 1013 拒绝（不升级、不发 connected）。
+    if not _GenericWSState.acquire():
+        await websocket.close(code=1013)
+        return
     try:
-        await websocket.send_json({
-            "type": "connected",
-            "data": {"version": VERSION},
-            "timestamp": datetime.now().isoformat(),
-        })
-        while True:
-            data = await websocket.receive_text()
-            try:
-                msg = json.loads(data)
-                msg_type = msg.get("type", "")
-                if msg_type == "ping":
-                    await websocket.send_json({
-                        "type": "pong",
-                        "timestamp": datetime.now().isoformat(),
-                    })
-                else:
-                    await websocket.send_json({
-                        "type": "ack",
-                        "data": {"received": msg_type},
-                        "timestamp": datetime.now().isoformat(),
-                    })
-            except json.JSONDecodeError:
-                pass
-    except WebSocketDisconnect:
-        pass
+        await websocket.accept()
+        try:
+            await websocket.send_json({
+                "type": "connected",
+                "data": {"version": VERSION},
+                "timestamp": datetime.now().isoformat(),
+            })
+            while True:
+                data = await websocket.receive_text()
+                try:
+                    msg = json.loads(data)
+                    msg_type = msg.get("type", "")
+                    if msg_type == "ping":
+                        await websocket.send_json({
+                            "type": "pong",
+                            "timestamp": datetime.now().isoformat(),
+                        })
+                    else:
+                        await websocket.send_json({
+                            "type": "ack",
+                            "data": {"received": msg_type},
+                            "timestamp": datetime.now().isoformat(),
+                        })
+                except json.JSONDecodeError:
+                    pass
+        except WebSocketDisconnect:
+            pass
+    finally:
+        _GenericWSState.release()
 
 
 @app.get("/ws/progress")

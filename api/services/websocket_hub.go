@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -52,6 +53,11 @@ type WSHub struct {
 	broadcast      chan []byte
 	maxConns       int
 	allowedOrigins map[string]struct{}
+	// active 是「已通过握手占槽」的连接计数（含尚未被 run() 收编入 map 的）。
+	// M7：必须在 hijack 之前同步判定，超额直接回 503，不能像旧实现那样先
+	// 101 升级、再由 run() 异步踢人——后者在连接风暴下照样耗尽文件描述符
+	// 与读/写 goroutine。
+	active atomic.Int32
 }
 
 // defaultWSServerPort 是构造默认 Origin 白名单时使用的服务端口
@@ -131,6 +137,41 @@ func (h *WSHub) SetMaxConns(n int) {
 	h.mu.Lock()
 	h.maxConns = n
 	h.mu.Unlock()
+}
+
+// tryAcquireSlot 在 hijack/101 之前同步占槽（M7）。
+// 超额时返回 false，调用方必须按普通 HTTP 拒绝（503），绝不能先升级。
+// 占槽成功后，连接结束时必须恰好调用一次 releaseSlot。
+func (h *WSHub) tryAcquireSlot() bool {
+	h.mu.RLock()
+	limit := h.maxConns
+	h.mu.RUnlock()
+	if limit <= 0 {
+		return false
+	}
+	if n := h.active.Add(1); int(n) > limit {
+		h.active.Add(-1)
+		return false
+	}
+	return true
+}
+
+// releaseSlot 释放一个握手槽位；允许轻微多退（钳到 0），绝不变负。
+func (h *WSHub) releaseSlot() {
+	for {
+		n := h.active.Load()
+		if n <= 0 {
+			return
+		}
+		if h.active.CompareAndSwap(n, n-1) {
+			return
+		}
+	}
+}
+
+// ActiveConns 返回当前已占槽的连接数（含收编途中）。
+func (h *WSHub) ActiveConns() int {
+	return int(h.active.Load())
 }
 
 // Run 启动 Hub 主循环（阻塞，应在 goroutine 中调用）
@@ -266,6 +307,14 @@ func (h *WSHub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// M7：连接数上限同样必须在 hijack 之前同步拒绝（503 + Retry-After），
+	// 否则风暴连接会先拿走 fd/内存，再被 run() 事后关闭，限额形同虚设。
+	if !h.tryAcquireSlot() {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "WebSocket 连接数已达上限，请稍后重试", http.StatusServiceUnavailable)
+		return
+	}
+
 	// 计算 Accept key
 	key := r.Header.Get("Sec-WebSocket-Key")
 	hash := sha1.New()
@@ -275,11 +324,13 @@ func (h *WSHub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 	// Hijack 连接
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		h.releaseSlot()
 		http.Error(w, "服务器不支持 Hijack", http.StatusInternalServerError)
 		return
 	}
 	conn, bufrw, err := hj.Hijack()
 	if err != nil {
+		h.releaseSlot()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -313,7 +364,10 @@ func (h *WSHub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 
 // readPump 读取 WebSocket 帧
 func (c *WSConn) readPump() {
+	// 槽位生命周期与读循环一致：连接断开读循环退出时释放 M7 握手槽，
+	// 随后再走 unregister 从 clients 摘除。
 	defer func() {
+		c.hub.releaseSlot()
 		c.hub.unregister <- c
 	}()
 

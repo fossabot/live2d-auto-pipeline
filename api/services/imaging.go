@@ -38,6 +38,26 @@ func decodeImageReader(r io.Reader) (image.Image, error) {
 	return img, nil
 }
 
+// rejectOversizedImageConfig 只解析文件头（不解码像素、不按解压后尺寸
+// 分配内存）就校验画布边界。标准库 image/png 没有像素总量保护，一张 ≤25MB
+// 的 PNG 可声明数万边长（解压后数十 GB），必须在完整解码前拒绝，防 OOM。
+func rejectOversizedImageConfig(r io.Reader) error {
+	cfg, _, err := image.DecodeConfig(r)
+	if err != nil {
+		return err
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return fmt.Errorf("图片尺寸非法（%dx%d）", cfg.Width, cfg.Height)
+	}
+	if cfg.Width > maxImageDimension || cfg.Height > maxImageDimension {
+		return fmt.Errorf(
+			"图片尺寸 %dx%d 超出像素上限（单边最大 %d），疑似解压炸弹",
+			cfg.Width, cfg.Height, maxImageDimension,
+		)
+	}
+	return nil
+}
+
 // NormalizeToCanvas 把 src 绘制到 maxW×maxH 的透明 RGBA 画布上
 // （左上对齐），并写出为 PNG。Live2D 的所有网格共享同一张画布，
 // 图层集必须在进入构建器之前完成这一规范化。
