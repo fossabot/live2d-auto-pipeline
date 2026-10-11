@@ -569,8 +569,8 @@ def create_env_file():
 # TTS Voice (edge-tts, free)
 TTS_VOICE=zh-CN-XiaoxiaoNeural
 
-# Server
-GO_API_HOST=0.0.0.0
+# Server（默认只绑本机回环；确需局域网访问时再显式改为 0.0.0.0）
+# GO_API_HOST=127.0.0.1
 GO_API_PORT=8080
 
 # Output

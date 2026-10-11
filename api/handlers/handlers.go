@@ -770,6 +770,15 @@ func (h *Handler) CreateCharacter(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.Response{Success: false, Error: "参数错误: " + err.Error()})
 		return
 	}
+	// ref_image 必须来自 /api/upload 产物（output/uploads 内），与
+	// AddCharacterReference 入口同一道防线；否则会把任意服务端可读文件
+	// 经 Python 复制进 assets（本地文件访问控制缺口）。
+	if req.RefImage != "" {
+		if err := services.ValidateUploadedImagePath(h.cfg, req.RefImage); err != nil {
+			c.JSON(http.StatusBadRequest, models.Response{Success: false, Error: err.Error()})
+			return
+		}
+	}
 	card, err := h.charSvc.CreateCharacter(req)
 	if err != nil {
 		h.serverError(c, "角色创建", err)

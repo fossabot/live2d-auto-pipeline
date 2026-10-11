@@ -13,8 +13,14 @@ import base64
 from typing import Optional
 
 import requests
+from urllib.parse import urlparse
 
-from core.image_gen.base import ImageProvider, GenerationResult, GenerationError
+from core.image_gen.base import (
+    ImageProvider,
+    GenerationResult,
+    GenerationError,
+    checked_image_download,
+)
 
 
 class SeedreamProvider(ImageProvider):
@@ -43,6 +49,9 @@ class SeedreamProvider(ImageProvider):
         super().__init__(config)
         self.model = self.config.seedream_version
         self.size = self.config.seedream_size
+        # 操作员显式配置的 ARK 网关主机 = 唯一的非公网信任来源
+        gateway = (urlparse(getattr(self.config, "ark_base_url", "") or "").hostname or "").lower()
+        self._trusted_hosts = frozenset({gateway} if gateway else ())
 
     def is_available(self) -> bool:
         return bool(self.config.ark_api_key)
@@ -177,9 +186,13 @@ class SeedreamProvider(ImageProvider):
                 if "b64_json" in item:
                     return base64.b64decode(item["b64_json"])
                 if "url" in item:
-                    img_resp = requests.get(item["url"], timeout=60)
-                    img_resp.raise_for_status()
-                    return img_resp.content
+                    # 上游返回的 URL 是不可信输入：SSRF 护栏 + 禁重定向 + 体积上限
+                    return checked_image_download(
+                        item["url"], trusted_hosts=self._trusted_hosts
+                    )
+        except GenerationError:
+            # 安全拦截（内网/元数据/超大响应）必须上抛，不得静默成"无图"
+            raise
         except Exception:
             return None
         return None

@@ -24,71 +24,26 @@
 """
 
 import base64
-import ipaddress
 import os
-import socket
 import time
-from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 import requests
 
-from core.image_gen.base import GenerationError, GenerationResult, ImageProvider
+from core.image_gen.base import (
+    CheckedURL as _CheckedURL,
+    GenerationError,
+    GenerationResult,
+    ImageProvider,
+    checked_image_download,
+)
 from core.logger import get_logger
 
 log = get_logger("image_gen.openai_compat")
 
 # OpenAI 尺寸档位 → 不强制映射，直接透传最接近的合法值
 _SUPPORTED_SIZES = ("1024x1024", "1024x1536", "1536x1024", "512x512", "256x256")
-
-
-class _CheckedURL:
-    """经过协议与解析 IP 边界校验的出站 URL。"""
-
-    __slots__ = ("url", "host")
-
-    def __init__(self, url: str, host: str):
-        self.url = url
-        self.host = host
-
-    @classmethod
-    def parse(cls, raw: str, trusted_hosts: frozenset) -> "_CheckedURL":
-        parsed = urlparse(raw)
-        if parsed.scheme not in ("http", "https"):
-            raise GenerationError(f"出站 URL 仅允许 http(s): {raw[:120]}")
-        host = (parsed.hostname or "").lower()
-        if not host:
-            raise GenerationError(f"出站 URL 缺少主机名: {raw[:120]}")
-        if host in trusted_hosts:
-            return cls(raw, host)
-        try:
-            literal = ipaddress.ip_address(host)
-        except ValueError:
-            literal = None
-        if literal is not None:
-            if not literal.is_global:
-                raise GenerationError(
-                    f"出站 URL 指向非公网地址，已拒绝: {host}"
-                )
-            return cls(raw, host)
-        # 主机名：解析出的所有地址都必须是公网地址（防 rebinding 到内网）
-        try:
-            infos = socket.getaddrinfo(host, None)
-        except (OSError, UnicodeError) as e:
-            raise GenerationError(f"出站 URL 主机解析失败: {host} ({e})") from e
-        if not infos:
-            raise GenerationError(f"出站 URL 主机解析为空: {host}")
-        for info in infos:
-            try:
-                ip = ipaddress.ip_address(info[4][0])
-            except ValueError as e:
-                raise GenerationError(f"出站 URL 解析出非法地址: {host}") from e
-            if not ip.is_global:
-                raise GenerationError(
-                    f"出站 URL 解析到非公网地址，已拒绝: {host} -> {info[4][0]}"
-                )
-        return cls(raw, host)
 
 
 class OpenAICompatProvider(ImageProvider):
@@ -173,16 +128,11 @@ class OpenAICompatProvider(ImageProvider):
             except Exception as e:
                 raise GenerationError(f"b64 图像解码失败: {e}") from e
         elif item.get("url"):
-            # 端点返回的下载 URL 是不可信输入：除公网校验外仅信任同网关主机，
-            # 且禁止重定向，防止被诱导访问内网或云元数据服务。
-            checked = _CheckedURL.parse(item["url"], self._trusted_hosts)
-            try:
-                dl = requests.get(checked.url, timeout=120, allow_redirects=False)
-            except requests.RequestException as e:
-                raise GenerationError(f"下载生成图像失败: {e}") from e
-            if dl.status_code != 200:
-                raise GenerationError(f"下载生成图像返回 {dl.status_code}")
-            image_bytes = dl.content
+            # 端点返回的下载 URL 是不可信输入：统一走共享护栏（公网校验 +
+            # 仅信任同网关主机 + 禁止重定向 + 体积上限）。
+            image_bytes = checked_image_download(
+                item["url"], trusted_hosts=self._trusted_hosts, timeout=120
+            )
         if not image_bytes:
             raise GenerationError("响应中既无 b64_json 也无 url")
 

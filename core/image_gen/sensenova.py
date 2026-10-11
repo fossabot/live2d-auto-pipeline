@@ -11,8 +11,14 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from urllib.parse import urlparse
 
-from core.image_gen.base import ImageProvider, GenerationResult, GenerationError
+from core.image_gen.base import (
+    ImageProvider,
+    GenerationResult,
+    GenerationError,
+    checked_image_download,
+)
 
 
 class SenseNovaProvider(ImageProvider):
@@ -107,9 +113,12 @@ class SenseNovaProvider(ImageProvider):
 
                 if image_url:
                     self._report_progress("Downloading", 80)
-                    img_resp = requests.get(image_url, timeout=60)
-                    img_resp.raise_for_status()
-                    img_data = img_resp.content
+                    # 上游返回的 URL 是不可信输入：SSRF 护栏 + 禁重定向 + 体积上限；
+                    # 同请求的网关主机作为唯一可信非公网来源。
+                    gateway_host = (urlparse(base_url).hostname or "").lower()
+                    img_data = checked_image_download(
+                        image_url, trusted_hosts=frozenset({gateway_host} if gateway_host else ())
+                    )
                 elif image_b64:
                     img_data = base64.b64decode(image_b64)
                 else:

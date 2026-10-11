@@ -10,7 +10,12 @@ from typing import Optional
 
 import requests
 
-from core.image_gen.base import ImageProvider, GenerationResult, GenerationError
+from core.image_gen.base import (
+    ImageProvider,
+    GenerationResult,
+    GenerationError,
+    read_bounded,
+)
 
 LIVE2D_NEGATIVE_PROMPT = (
     "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, "
@@ -70,12 +75,14 @@ class PollinationsProvider(ImageProvider):
         last_error = None
         for attempt in range(self.max_retries):
             try:
+                # 此处 URL 由代码常量+编码后的 prompt 构造（非上游返回），SSRF
+                # 面可控；允许其 CDN 重定向，但响应体流式读取并限制总体积。
                 resp = requests.get(url, params=params, timeout=self.timeout, stream=True)
                 resp.raise_for_status()
-
+                content = read_bounded(resp)
                 # Check content type is an image
                 content_type = resp.headers.get('Content-Type', '')
-                if 'image' not in content_type and not resp.content[:8].startswith(b'\x89PNG') and not resp.content[:3] == b'\xff\xd8\xff':
+                if 'image' not in content_type and not content[:8].startswith(b'\x89PNG') and not content[:3] == b'\xff\xd8\xff':
                     # Might have gotten HTML error page
                     raise GenerationError(
                         f"Unexpected content type: {content_type}",
@@ -84,7 +91,7 @@ class PollinationsProvider(ImageProvider):
                     )
 
                 self._report_progress("Downloading", 80)
-                path = self._save_image(resp.content, output_path)
+                path = self._save_image(content, output_path)
                 self._report_progress("Done", 100)
 
                 return GenerationResult(

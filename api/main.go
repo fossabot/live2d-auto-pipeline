@@ -99,6 +99,11 @@ func main() {
 	allowedHosts := buildAllowedHosts(cfg.Server.AllowedOrigins, os.Getenv("LIVE2D_ALLOWED_HOSTS"))
 	r.Use(allowedHostMiddleware(allowedHosts))
 
+	// 跨站请求护栏（P3-2：本地服务 CSRF 防御）。multipart/urlencoded 表单
+	// POST 是 CORS「简单请求」不触发预检，恶意网页可直接对 127.0.0.1 发起
+	// 状态变更（Host 白名单拦不住，因为目标主机名本来就合法）。
+	r.Use(crossSiteGuardMiddleware(cfg.Server.AllowedOrigins))
+
 	// 请求超时中间件
 	r.Use(func(c *gin.Context) {
 		c.Request.Header.Set("Connection", "keep-alive")
@@ -474,6 +479,79 @@ func allowedHostMiddleware(allowed map[string]struct{}) gin.HandlerFunc {
 		}
 		if _, ok := allowed[host]; !ok {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "非法的 Host 来源"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// isSafeHTTPMethod 按 RFC 9110 判定安全方法（只读/元数据，不改变服务状态）。
+func isSafeHTTPMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+// effectivePort 返回 host:port 中显式端口；缺省时按 scheme 补 80/443，
+// 使 "http://127.0.0.1" 与 Host "127.0.0.1:80" 视为同源。
+func effectivePort(hostPort, scheme string) string {
+	if _, p, err := net.SplitHostPort(hostPort); err == nil && p != "" {
+		return p
+	}
+	if strings.EqualFold(scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
+// originAllowed 判定请求来源是否合法：
+//  1. 精确命中 CORS 白名单（dev 前端 localhost:3000 等）；
+//  2. 与被请求 Host 同源（主机名 + 端口完全一致，覆盖 Go 托管前端/Tauri）。
+func originAllowed(origin string, allowedExact map[string]struct{}, requestHost string) bool {
+	o := strings.ToLower(strings.TrimSpace(origin))
+	if o == "" {
+		return false
+	}
+	if _, ok := allowedExact[o]; ok {
+		return true
+	}
+	u, err := url.Parse(o)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return false
+	}
+	if canonicalHostname(u.Host) != canonicalHostname(requestHost) {
+		return false
+	}
+	return effectivePort(u.Host, u.Scheme) == effectivePort(requestHost, u.Scheme)
+}
+
+// crossSiteGuardMiddleware 拦截针对本地无鉴权服务的跨站状态变更请求。
+// 规则（仅作用于非安全方法；OPTIONS 预检交给 CORS 中间件）：
+//   - 带 Origin 且非白名单/非同源 → 403（Chrome/Firefox/Safari 的跨站 POST
+//     必带 Origin，覆盖 multipart 表单与 fetch 简单请求）；
+//   - Fetch Metadata 显示 cross-site → 403（覆盖无 Origin 的旧浏览器路径）；
+//   - 完全无 Origin/Sec-Fetch-Site（curl、脚本、Tauri 原生调用）放行——
+//     CSRF 的威胁模型是浏览器环境，非浏览器客户端不受其约束。
+func crossSiteGuardMiddleware(allowedOrigins []string) gin.HandlerFunc {
+	allowedExact := make(map[string]struct{}, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		allowedExact[strings.TrimSuffix(strings.ToLower(strings.TrimSpace(o)), "/")] = struct{}{}
+	}
+	return func(c *gin.Context) {
+		if isSafeHTTPMethod(c.Request.Method) {
+			c.Next()
+			return
+		}
+		if origin := c.Request.Header.Get("Origin"); origin != "" {
+			if !originAllowed(origin, allowedExact, c.Request.Host) {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "非法的请求来源"})
+				return
+			}
+		} else if c.Request.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "拒绝跨站请求"})
 			return
 		}
 		c.Next()

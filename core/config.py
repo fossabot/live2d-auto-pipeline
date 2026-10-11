@@ -177,7 +177,9 @@ class SecureConfig:
             'IMAGE_MODEL': 'gpt-image-1',
             'LIVE2D_LOG_LEVEL': 'INFO',
             'LIVE2D_TELEMETRY': '0',
-            'GO_API_HOST': '0.0.0.0',
+            # 安全默认：桌面形态只绑回环；容器由 Dockerfile/compose 显式
+            # 注入 0.0.0.0，不依赖这里的默认值。
+            'GO_API_HOST': '127.0.0.1',
             'GO_API_PORT': '8080',
             'GO_API_TIMEOUT': '120',  # P1-4 fix: configurable timeout, default 120s
         }

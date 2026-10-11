@@ -1,0 +1,19 @@
+# Dependabot 负责让「pin 到 SHA 的 action」与各生态依赖保持更新。
+# Action 升级 PR 会同时更新 SHA 与行尾版本注释；每周一批，避免日常噪音。
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
