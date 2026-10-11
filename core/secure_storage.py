@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Live2D Master Agent - Secure Storage Module (P0-4 FIXED: No XOR fallback)
+Live2D Master Agent - Secure Storage Module
 
 Security:
 - REQUIRES cryptography library (Fernet AES-128-CBC + HMAC-SHA256)
-- PBKDF2-HMAC-SHA256 key derivation (100,000 iterations)
-- Random per-file salt (not just system info)
-- File permissions 0600 on Unix
+- 主密钥为首次启动时生成的随机 Fernet key，存放于独立的 0600 权限文件
+  （与密文分离保管；可用 LIVE2D_VAULT_KEY_FILE 覆盖路径），不是由
+  HOSTNAME/USER 等非秘密系统信息推导——旧版方案已废弃（见 _derive_legacy_key）。
+- 旧版确定性密钥加密的保险库仍可读取（decrypt 回退），并在启动时通过
+  upgrade_file 原地重加密迁移到随机密钥。
+- File permissions 0600（密钥目录 0700）on Unix
 - Memory cleanup on exit
 - NO insecure XOR fallback - raises ImportError with clear message if cryptography missing
 """
@@ -17,6 +20,7 @@ import json
 import base64
 import hashlib
 import secrets
+import stat
 import atexit
 from pathlib import Path
 from typing import Optional, Dict
@@ -43,28 +47,100 @@ def _require_crypto():
         )
 
 
-class SecureStorage:
-    """Fernet-based secure storage using PBKDF2 key derivation.
+def _default_master_key_path() -> Path:
+    """随机主密钥文件的存放位置：用户配置目录（与项目文件/密文分离）。
 
-    Key derivation uses a random salt stored with each encrypted file,
-    making keys unique per installation and preventing cross-machine decryption.
+    - LIVE2D_VAULT_KEY_FILE 显式覆盖（测试/运维/便携部署）；
+    - Windows: %APPDATA%/live2d-master-agent/vault.key
+    - macOS:   ~/Library/Application Support/live2d-master-agent/vault.key
+    - Linux:   $XDG_CONFIG_HOME 或 ~/.config/live2d-master-agent/vault.key
+    """
+    override = os.environ.get("LIVE2D_VAULT_KEY_FILE", "").strip()
+    if override:
+        return Path(override)
+    home = Path.home()
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
+        return base / "live2d-master-agent" / "vault.key"
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "live2d-master-agent" / "vault.key"
+    base = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
+    return base / "live2d-master-agent" / "vault.key"
+
+
+def _harden_path(path: Path) -> None:
+    """Unix 下把密钥目录收为 0700、文件收为 0600（Windows 忽略）。"""
+    if os.name == "nt":
+        return
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    try:
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
+class SecureStorage:
+    """Fernet-based secure storage with a random, file-backed master key.
+
+    主密钥在首次使用时随机生成并独立落盘；旧版「系统信息确定性推导」密钥
+    仅作为解密回退（_derive_legacy_key），用于迁移历史保险库，不再用于加密。
     """
 
     APP_IDENTIFIER = b'live2d-master-agent-v8.0-secure-storage'
-    PBKDF2_ITERATIONS = 200_000  # Increased from 100k for v8
+    PBKDF2_ITERATIONS = 200_000  # 仅用于旧保险库的兼容解密
     KEY_LENGTH = 32  # 256-bit key for Fernet
 
-    def __init__(self):
+    def __init__(self, master_key_file: Optional[str] = None):
         _require_crypto()
-        self._master_key = self._derive_master_key()
+        self._key_path = Path(master_key_file) if master_key_file else _default_master_key_path()
+        self._master_key = self._load_or_create_master_key()
+        self._legacy_key: Optional[bytes] = None  # 懒加载，避免无谓的 PBKDF2
 
-    def _derive_master_key(self) -> bytes:
-        """Derive the master key from system-specific salt + app identifier.
+    def _load_or_create_master_key(self) -> bytes:
+        """加载既有随机密钥；不存在则生成、0600 落盘（临时文件+原子替换）。"""
+        path = self._key_path
+        if path.exists():
+            key = path.read_bytes().strip()
+            if key:
+                return key
+        key = Fernet.generate_key()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            try:
+                path.parent.chmod(0o700)
+            except OSError:
+                pass
+        tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+        try:
+            # O_EXCL 防止两个并发首启互相覆盖；读到他人文件时直接改用其内容
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, key)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except FileExistsError:
+            tmp.unlink(missing_ok=True)
+            if path.exists():
+                existing = path.read_bytes().strip()
+                if existing:
+                    return existing
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
+        _harden_path(path)
+        return key
 
-        Uses multiple sources of entropy so copied files can't be decrypted
-        on other machines.
+    def _derive_legacy_key(self) -> bytes:
+        """[已废弃] 旧版确定性主密钥推导，仅用于解密历史保险库。
+
+        旧方案的盐来自 HOSTNAME/USER/家目录（低熵、非秘密、常随项目文件
+        一起泄露），口令是源码常量——任何拿到 .env.encrypted 的人都能离线
+        还原，因此绝不能再用于新加密。
         """
-        # System-specific components
         salt_parts = [
             os.environ.get('HOSTNAME', ''),
             os.environ.get('USER', os.environ.get('USERNAME', '')),
@@ -72,8 +148,6 @@ class SecureStorage:
             str(Path.home()),
         ]
         salt_material = '|'.join(salt_parts).encode('utf-8')
-
-        # PBKDF2 with app identifier as password, system info as salt
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=self.KEY_LENGTH,
@@ -82,6 +156,16 @@ class SecureStorage:
         )
         derived = kdf.derive(self.APP_IDENTIFIER)
         return base64.urlsafe_b64encode(derived)
+
+    def _get_legacy_key(self) -> bytes:
+        if self._legacy_key is None:
+            self._legacy_key = self._derive_legacy_key()
+        return self._legacy_key
+
+    def _decrypt_with_current_key(self, ciphertext: str) -> str:
+        """只用当前随机密钥解密；失败抛 InvalidToken。"""
+        raw = base64.urlsafe_b64decode(ciphertext.encode('ascii'))
+        return Fernet(self._master_key).decrypt(raw).decode('utf-8')
 
     def encrypt(self, plaintext: str) -> str:
         """Encrypt a string using Fernet (AES-128-CBC + HMAC-SHA256).
@@ -98,18 +182,63 @@ class SecureStorage:
     def decrypt(self, ciphertext: str) -> Optional[str]:
         """Decrypt a Fernet-encrypted string.
 
-        Returns plaintext or None if decryption fails.
+        优先用当前随机密钥；失败时回退到旧版确定性密钥（迁移期兼容），
+        两者都失败返回 None。
         """
         _require_crypto()
         if not ciphertext:
             return None
         try:
-            f = Fernet(self._master_key)
+            return self._decrypt_with_current_key(ciphertext)
+        except (InvalidToken, base64.binascii.Error, ValueError, UnicodeDecodeError):
+            pass
+        try:
             raw = base64.urlsafe_b64decode(ciphertext.encode('ascii'))
-            decrypted = f.decrypt(raw)
-            return decrypted.decode('utf-8')
-        except (InvalidToken, Exception, base64.binascii.Error):  # type: ignore
+            return Fernet(self._get_legacy_key()).decrypt(raw).decode('utf-8')
+        except (InvalidToken, base64.binascii.Error, ValueError, UnicodeDecodeError):
             return None
+
+    def upgrade_file(self, filepath: str) -> bool:
+        """把旧版确定性密钥加密的保险库原地重加密为当前随机密钥。
+
+        - 文件不存在、为空或已是当前密钥加密 → 返回 False；
+        - 旧密钥可解 → 0600 原子重写为新密文 → 返回 True；
+        - 两种密钥都解不开（损坏/外来源）→ 保持原文件不动并返回 False。
+        """
+        _require_crypto()
+        path = Path(filepath)
+        if not path.exists():
+            return False
+        try:
+            ciphertext = path.read_text(encoding='utf-8')
+        except OSError:
+            return False
+        if not ciphertext.strip():
+            return False
+        try:
+            self._decrypt_with_current_key(ciphertext)
+            return False  # 已是当前密钥方案
+        except (InvalidToken, base64.binascii.Error, ValueError, UnicodeDecodeError):
+            pass
+        try:
+            raw = base64.urlsafe_b64decode(ciphertext.encode('ascii'))
+            plaintext = Fernet(self._get_legacy_key()).decrypt(raw).decode('utf-8')
+        except (InvalidToken, base64.binascii.Error, ValueError, UnicodeDecodeError):
+            return False
+        new_token = self.encrypt(plaintext)
+        tmp = path.with_name(f".{path.name}.up-{os.getpid()}-{secrets.token_hex(4)}")
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, new_token.encode('ascii'))
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            return False
+        _harden_path(path)
+        return True
 
     def encrypt_to_file(self, data: dict, filepath: str) -> bool:
         """Encrypt a dict and save to file with 0600 permissions."""
@@ -187,6 +316,12 @@ class EncryptedConfig:
         self._cache: Dict[str, str] = {}
         root = os.environ.get("LIVE2D_PROJECT_ROOT")
         self._file = Path(root) / ".env.encrypted" if root else Path(__file__).parent.parent / ".env.encrypted"
+        # 首次启动即把旧版确定性密钥加密的保险库迁移到随机主密钥；
+        # 失败不阻塞启动（读路径仍有旧密钥回退）。
+        try:
+            self._storage.upgrade_file(str(self._file))
+        except Exception:
+            pass
         atexit.register(self.clear_cache)
 
     def store_api_key(self, provider: str, api_key: str) -> bool:
