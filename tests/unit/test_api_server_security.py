@@ -22,6 +22,7 @@ from urllib.parse import quote
 
 import pytest
 from PIL import Image
+from starlette.websockets import WebSocketDisconnect
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -239,3 +240,103 @@ def test_within_output_root_unit(tmp_path):
     # 输出根之外拒绝（含 /tmp、项目根的其他目录）
     assert srv._within_output_root(tmp_path) is False
     assert srv._within_output_root(srv.PROJECT_ROOT / "core" / "security.py") is False
+
+
+# ---------- /api/segment：源图必须位于输出根内（P1：防本地图片外传） ----------
+def test_segment_rejects_source_outside_output_root(client, tmp_path, monkeypatch):
+    out_root = tmp_path / "out_root"
+    out_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.png"
+    Image.new("RGBA", (32, 32), (10, 20, 30, 255)).save(secret)
+    monkeypatch.setattr(srv, "OUTPUT_DIR", out_root)
+
+    r = client.post("/api/segment", json={"image_path": str(secret), "method": "kmeans"})
+    assert r.status_code == 500
+    body = r.json()
+    assert "必须位于输出目录内" in body["error"]
+    # 不得回显被拒路径（避免成为文件存在性 oracle）
+    assert str(secret) not in body["error"]
+    # 攻击失败后输出根内不得出现任何分层产物（preview 复制链被切断的证据）
+    assert not list(out_root.glob("layers_*"))
+
+
+def test_segment_accepts_source_inside_output_root(client, tmp_path, monkeypatch):
+    out_root = tmp_path / "out_root"
+    out_root.mkdir()
+    src = out_root / "uploads" / "src.png"
+    src.parent.mkdir(parents=True)
+    Image.new("RGBA", (32, 32), (120, 200, 60, 255)).save(src)
+    monkeypatch.setattr(srv, "OUTPUT_DIR", out_root)
+
+    r = client.post("/api/segment", json={"image_path": str(src), "method": "kmeans"})
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    layers_dir = Path(data["layers_dir"])
+    # 合法路径正常跑通，且产物落在输出根内（与生产链路一致）
+    assert layers_dir.parent == out_root
+    assert data["layer_count"] >= 1
+
+
+def test_resolve_segment_source_relative_path_anchors_at_output_root(tmp_path):
+    # 无 monkeypatch 的纯函数测试：临时改模块级 OUTPUT_DIR
+    original = srv.OUTPUT_DIR
+    try:
+        srv.OUTPUT_DIR = tmp_path
+        (tmp_path / "a.png").write_bytes(b"x")
+        assert srv._resolve_segment_source("a.png") == tmp_path / "a.png"
+        with pytest.raises(RuntimeError, match="必须位于输出目录内"):
+            srv._resolve_segment_source(str(tmp_path.parent / "b.png"))
+    finally:
+        srv.OUTPUT_DIR = original
+
+
+# ---------- WebSocket Origin 白名单（P1：跨站网页不得直连本地 WS） ----------
+@pytest.mark.parametrize("path", ["/ws/tracking", "/api/ws"])
+def test_ws_rejects_cross_site_origin(client, path):
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect(path, headers={"Origin": "http://evil.example"}):
+            pass
+    # 1008 = Policy Violation：accept 之前拒绝，浏览器拿不到连接
+    assert exc.value.code == 1008
+
+
+@pytest.mark.parametrize("path", ["/ws/tracking", "/api/ws"])
+def test_ws_allows_whitelisted_and_missing_origin(client, path):
+    # 白名单来源（本地工作台）
+    with client.websocket_connect(path, headers={"Origin": "http://localhost:3000"}) as ws:
+        msg = ws.receive_json()
+        assert msg["type"] in ("tracking_ready", "connected")
+    # 无 Origin（非浏览器客户端，如桌面原生进程）
+    with client.websocket_connect(path) as ws:
+        msg = ws.receive_json()
+        assert msg["type"] in ("tracking_ready", "connected")
+
+
+def test_ws_self_origin_is_allowed(client):
+    # 服务自身同源（内嵌页面从 :8080 连）必须放行
+    with client.websocket_connect(
+        "/api/ws", headers={"Origin": "http://127.0.0.1:8080"}
+    ) as ws:
+        assert ws.receive_json()["type"] == "connected"
+
+
+def test_tracking_ws_enforces_connection_cap(client, monkeypatch):
+    monkeypatch.setattr(srv._TrackerState, "WS_CLIENT_LIMIT", 1)
+    # 让面捕保持"运行中"，第一条连接会驻留在推流循环里占住槽位
+    monkeypatch.setattr(srv._TrackerState, "running", True)
+    try:
+        with client.websocket_connect("/ws/tracking") as first:
+            assert first.receive_json()["type"] == "tracking_ready"
+            # 第二条连接必须被拒绝（1013 = Try Again Later）
+            with pytest.raises(WebSocketDisconnect) as exc:
+                with client.websocket_connect("/ws/tracking"):
+                    pass
+            assert exc.value.code == 1013
+    finally:
+        monkeypatch.setattr(srv._TrackerState, "running", False)
+    # 连接全部关闭后槽位必须释放，不影响后续使用
+    assert srv._TrackerState.ws_clients == 0
+    with client.websocket_connect("/ws/tracking") as ws:
+        assert ws.receive_json()["type"] == "tracking_ready"

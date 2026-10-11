@@ -43,6 +43,10 @@ func ClampImageDimensions(width, height int) (int, int) {
 	return clampImageDimension(width), clampImageDimension(height)
 }
 
+// ErrPathOutsideBase 是目录归属校验失败的哨兵错误，handler 层可用 errors.Is
+// 把它映射为 400（请求非法）而非 500（服务内部错误）。
+var ErrPathOutsideBase = fmt.Errorf("路径超出允许的输出目录范围")
+
 // validateWithinBase 判定 target 解析为绝对路径后是否仍位于 baseDir 之内。
 // 与 handlers.isPathSafe 同一语义（Abs + Rel 前缀检查），用于桥接层把请求体
 // 中的 layers_dir/output_dir 等路径参数限定在输出根目录，阻止绝对路径穿越。
@@ -57,7 +61,7 @@ func validateWithinBase(target, baseDir, label string) error {
 	}
 	rel, err := filepath.Rel(absBase, absTarget)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("%s 必须位于输出目录内", label)
+		return fmt.Errorf("%w: %s必须位于输出目录内", ErrPathOutsideBase, label)
 	}
 	return nil
 }

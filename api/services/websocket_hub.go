@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,24 +45,85 @@ type WSConn struct {
 
 // WSHub WebSocket 中心：管理所有客户端连接
 type WSHub struct {
-	mu         sync.RWMutex
-	clients    map[string]*WSConn
-	register   chan *WSConn
-	unregister chan *WSConn
-	broadcast  chan []byte
-	maxConns   int
+	mu             sync.RWMutex
+	clients        map[string]*WSConn
+	register       chan *WSConn
+	unregister     chan *WSConn
+	broadcast      chan []byte
+	maxConns       int
+	allowedOrigins map[string]struct{}
 }
 
-// NewWSHub 创建 WebSocket Hub（默认最大连接数 100）
+// defaultWSServerPort 是构造默认 Origin 白名单时使用的服务端口
+// （NewWSHubWithOrigins 会按真实配置端口重建集合）。
+const defaultWSServerPort = 8080
+
+// selfOrigins 生成服务自身的同源 Origin（页面由 Go 内嵌服务在该端口提供，
+// Tauri webview 与独立部署都从这里连 WS）。
+func selfOrigins(port int) map[string]struct{} {
+	origins := make(map[string]struct{}, 4)
+	for _, scheme := range []string{"http", "https"} {
+		for _, host := range []string{"localhost", "127.0.0.1"} {
+			origins[fmt.Sprintf("%s://%s:%d", scheme, host, port)] = struct{}{}
+		}
+	}
+	return origins
+}
+
+// NewWSHub 创建 WebSocket Hub（默认最大连接数 100）。
+// 默认 Origin 白名单：本地工作台（:3000）+ 服务自身（:8080）。
 func NewWSHub() *WSHub {
 	hub := &WSHub{
-		clients:    make(map[string]*WSConn),
-		register:   make(chan *WSConn),
-		unregister: make(chan *WSConn),
-		broadcast:  make(chan []byte, 256),
-		maxConns:   100,
+		clients:        make(map[string]*WSConn),
+		register:       make(chan *WSConn),
+		unregister:     make(chan *WSConn),
+		broadcast:      make(chan []byte, 256),
+		maxConns:       100,
+		allowedOrigins: NewWSHubWithOrigins(nil, defaultWSServerPort).allowedOrigins,
 	}
 	return hub
+}
+
+// NewWSHubWithOrigins 用 CORS 配置的白名单 + 服务自身 Origin 创建 Hub。
+// 浏览器的 WebSocket 握手不受 CORS 中间件保护：恶意页面可用 JS 直连
+// 127.0.0.1 上的本服务旁听任务进度，因此 WS 必须独立校验 Origin。
+func NewWSHubWithOrigins(extraOrigins []string, serverPort int) *WSHub {
+	if serverPort <= 0 {
+		serverPort = defaultWSServerPort
+	}
+	origins := selfOrigins(serverPort)
+	// 本地开发工作台（Next.js :3000）及配置中的其他可信来源
+	for _, o := range []string{"http://localhost:3000", "http://127.0.0.1:3000"} {
+		origins[o] = struct{}{}
+	}
+	for _, o := range extraOrigins {
+		if o = strings.TrimSpace(o); o != "" && o != "*" {
+			origins[o] = struct{}{}
+		}
+	}
+	return &WSHub{
+		clients:        make(map[string]*WSConn),
+		register:       make(chan *WSConn),
+		unregister:     make(chan *WSConn),
+		broadcast:      make(chan []byte, 256),
+		maxConns:       100,
+		allowedOrigins: origins,
+	}
+}
+
+// originAllowed 校验 WS 握手来源。
+// 关键区分：浏览器发起 WS 时**一定**带 Origin；curl/原生桌面进程等非浏览器
+// 客户端不带。因此「无 Origin 放行、有 Origin 必查白名单」既能挡住跨站网页，
+// 又不会误伤 Tauri webview 之外的本机程序调用。
+func (h *WSHub) originAllowed(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	h.mu.RLock()
+	_, ok := h.allowedOrigins[origin]
+	h.mu.RUnlock()
+	return ok
 }
 
 // SetMaxConns 设置最大连接数
@@ -194,6 +256,13 @@ func (h *WSHub) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 	// 验证 WebSocket 握手
 	if r.Header.Get("Upgrade") != "websocket" {
 		http.Error(w, "需要 WebSocket 升级", http.StatusBadRequest)
+		return
+	}
+
+	// Origin 白名单：必须在 hijack 之前、按普通 HTTP 拒绝，浏览器收到的是
+	// 握手失败（拿不到 101），跨站页面无法建立 WS 连接。
+	if !h.originAllowed(r) {
+		http.Error(w, "WebSocket origin not allowed", http.StatusForbidden)
 		return
 	}
 

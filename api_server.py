@@ -74,6 +74,7 @@ import asyncio
 import tempfile
 import zipfile
 import re
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -272,6 +273,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------- WebSocket 安全 ----------
+# 浏览器的 WebSocket 握手不受 CORS 中间件保护：恶意网页可直接
+# new WebSocket("ws://127.0.0.1:8080/ws/tracking") 连本地服务，
+# 窃取摄像头面捕数据或旁听任务。规则与 Go 服务一致：
+# 无 Origin（curl / 桌面原生进程等非浏览器客户端）放行；有 Origin 必命中白名单。
+def _ws_allowed_origin_set() -> set:
+    origins = set(CORS_ORIGINS)
+    # 服务自身同源（内嵌页面/独立部署由该端口提供页面）
+    for host in ("localhost", "127.0.0.1"):
+        origins.add(f"http://{host}:{SERVER_PORT}")
+    return origins
+
+
+_WS_ALLOWED_ORIGINS = _ws_allowed_origin_set()
+
+
+def _ws_origin_allowed(websocket: WebSocket) -> bool:
+    # 操作员显式配置 "*" 时与 CORS 行为保持一致（自行承担跨站风险）
+    if CORS_ORIGINS == ["*"]:
+        return True
+    origin = websocket.headers.get("origin", "")
+    return origin == "" or origin in _WS_ALLOWED_ORIGINS
 
 
 # ---------- 工具函数 ----------
@@ -666,6 +691,26 @@ async def latest_generation():
         return err(f"读取最近生成记录失败: {e}", 500)
 
 
+def _resolve_segment_source(src: str) -> Path:
+    """把分层请求的源图路径限定在输出根内并确认是普通文件。
+
+    与 Go 桥接 validateWithinBase(imagePath, Output.BaseDir) 同一信任锚：
+    分层引擎会把源图原样另存为 layers_*/preview.png，而产物可经 /output/
+    下载——若接受根之外的绝对路径，等于把磁盘上任意可读图片复制进可下载
+    目录（本地文件外传）。相对路径按 OUTPUT_DIR 解析（生成/上传产物都在此根下）。
+    """
+    if not src:
+        raise RuntimeError("找不到可用的源图片，请先生成角色图")
+    p = Path(src)
+    if not p.is_absolute():
+        p = OUTPUT_DIR / p
+    if not _within_output_root(p):
+        raise RuntimeError("源图片必须位于输出目录内")
+    if not p.is_file():
+        raise RuntimeError("找不到可用的源图片，请先生成角色图")
+    return p
+
+
 def _run_segment(req: "SegmentRequest") -> Dict[str, Any]:
     """对指定图片执行分层并导出 PSD（在线程池中调用）。"""
     from PIL import Image
@@ -678,9 +723,9 @@ def _run_segment(req: "SegmentRequest") -> Dict[str, Any]:
                 src = json.load(f).get("image_path", "")
         except Exception:
             src = ""
-    path = Path(src) if src else None
-    if path is None or not path.is_file():
-        raise RuntimeError("找不到可用的源图片，请先生成角色图")
+    # latest_generation.json 记录的路径同样不可信（文件可被外部修改），
+    # 统一走输出根归属校验。
+    path = _resolve_segment_source(src)
 
     img = Image.open(path).convert("RGBA")
     out_dir = OUTPUT_DIR / f"layers_{int(time.time())}"
@@ -1116,6 +1161,25 @@ class _TrackerState:
     params: Dict[str, float] = {}
     error: str = ""
 
+    # 面捕 WS 连接计数：面捕参数是本机摄像头的高频推流，必须限制并发连接数，
+    # 防止恶意页面开大量 WS 把事件循环与带宽占满。
+    WS_CLIENT_LIMIT = 10
+    _ws_clients_lock = threading.Lock()
+    ws_clients = 0
+
+    @classmethod
+    def acquire_ws_slot(cls) -> bool:
+        with cls._ws_clients_lock:
+            if cls.ws_clients >= cls.WS_CLIENT_LIMIT:
+                return False
+            cls.ws_clients += 1
+            return True
+
+    @classmethod
+    def release_ws_slot(cls) -> None:
+        with cls._ws_clients_lock:
+            cls.ws_clients = max(0, cls.ws_clients - 1)
+
     @classmethod
     def reset(cls):
         cls.tracker = None
@@ -1127,7 +1191,6 @@ class _TrackerState:
 
 def _tracking_loop() -> None:
     """后台线程：读取摄像头帧 → blendshapes → Live2D 参数。"""
-    import threading
     from drivers.face_tracker.blendshape_mapper import BlendShapeMapper
 
     mapper = BlendShapeMapper()
@@ -1155,8 +1218,6 @@ def _tracking_loop() -> None:
 @app.post("/api/tracking/start")
 async def tracking_start():
     """启动摄像头面捕（mediapipe），参数经 /ws/tracking 推送。"""
-    import threading
-
     if _TrackerState.running:
         return ok({"running": True}, "面捕已在运行")
     try:
@@ -1209,6 +1270,15 @@ async def tracking_stop():
 @app.websocket("/ws/tracking")
 async def ws_tracking(websocket: WebSocket):
     """向浏览器推送实时面捕参数（Live2D 参数映射，30fps 节流）。"""
+    # 浏览器 WS 握手不触发 CORS：恶意网页可直连本端点窃取摄像头面捕数据，
+    # 必须在 accept 之前按 Origin 白名单拒绝（1008 = Policy Violation）。
+    if not _ws_origin_allowed(websocket):
+        await websocket.close(code=1008)
+        return
+    if not _TrackerState.acquire_ws_slot():
+        # 1013 = Try Again Later：面捕推流连接数已达上限
+        await websocket.close(code=1013)
+        return
     await websocket.accept()
     try:
         await websocket.send_json({"type": "tracking_ready", "timestamp": datetime.now().isoformat()})
@@ -1231,10 +1301,16 @@ async def ws_tracking(websocket: WebSocket):
             await asyncio.sleep(1 / 30)
     except WebSocketDisconnect:
         pass
+    finally:
+        _TrackerState.release_ws_slot()
 
 
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    # 与 /ws/tracking 同一道 Origin 闸门：跨站页面不得建立 WS 连接。
+    if not _ws_origin_allowed(websocket):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     try:
         await websocket.send_json({

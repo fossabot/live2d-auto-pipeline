@@ -229,6 +229,11 @@ func (pb *PythonBridge) CreatePSDPlan(imagePath string) (*models.PSDLayerRespons
 	if err := validatePath(imagePath); err != nil {
 		return nil, fmt.Errorf("路径验证失败: %v", err)
 	}
+	// 与 SegmentImage 同一信任锚：PSD 规划会原样保存 preview.png，
+	// 输出根之外的图片不得进入处理链路（/psd-plan 与 /export/psd 共用本入口）。
+	if err := validateWithinBase(imagePath, pb.cfg.Output.BaseDir, "源图片"); err != nil {
+		return nil, err
+	}
 	if _, err := os.Stat(imagePath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("图片不存在: %s", imagePath)
 	}
@@ -431,6 +436,12 @@ print(json.dumps({"method": result.get("method", method), "layers_dir": str(out_
 
 func (pb *PythonBridge) SegmentImage(imagePath, method string) (map[string]interface{}, error) {
 	if err := validatePath(imagePath); err != nil {
+		return nil, err
+	}
+	// FF-16-S2 落地：绝对路径白名单。源图只允许来自输出根（上传图在 output/uploads、
+	// 生成图在 output/ 与 output/characters/），否则可把磁盘任意可读图片处理后
+	// 借 preview.png 复制到 output 再经 /output/ 下载，构成本地文件外传。
+	if err := validateWithinBase(imagePath, pb.cfg.Output.BaseDir, "源图片"); err != nil {
 		return nil, err
 	}
 	if _, err := os.Stat(imagePath); err != nil {

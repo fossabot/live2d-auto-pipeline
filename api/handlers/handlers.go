@@ -40,7 +40,7 @@ func NewHandler(cfg *config.Config, imageGenerator *services.ImageGenerator, cac
 		cache:          cache,
 		charSvc:        services.NewCharacterService(cfg),
 		chatSvc:        services.NewChatService(cfg),
-		wsHub:          services.NewWSHub(),
+		wsHub:          services.NewWSHubWithOrigins(cfg.Server.AllowedOrigins, cfg.Server.Port),
 		startTime:      time.Now(),
 	}
 
@@ -277,6 +277,13 @@ func (h *Handler) CreatePSDPlan(c *gin.Context) {
 
 	result, err := h.pythonBridge.CreatePSDPlan(req.ImagePath)
 	if err != nil {
+		if errors.Is(err, services.ErrPathOutsideBase) {
+			c.JSON(http.StatusBadRequest, models.Response{
+				Success: false,
+				Error:   err.Error(),
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, models.Response{
 			Success: false,
 			Error:   "PSD分层失败: " + err.Error(),
@@ -443,8 +450,10 @@ func (h *Handler) SegmentImage(c *gin.Context) {
 			return
 		}
 	}
+	// 相对路径按输出根解析：前端传来的合法源图（上传图/生成图）都在输出根内，
+	// 桥接层随后还会做 validateWithinBase 归属校验，根之外的绝对路径一律拒绝。
 	if !filepath.IsAbs(imagePath) {
-		imagePath = filepath.Join(h.cfg.Python.ScriptsDir, imagePath)
+		imagePath = filepath.Join(h.cfg.Output.BaseDir, imagePath)
 	}
 
 	result, err := h.pythonBridge.SegmentImage(imagePath, req.Method)
@@ -452,6 +461,9 @@ func (h *Handler) SegmentImage(c *gin.Context) {
 		status := http.StatusInternalServerError
 		if errors.Is(err, services.ErrPythonTimeout) {
 			status = http.StatusGatewayTimeout
+		}
+		if errors.Is(err, services.ErrPathOutsideBase) {
+			status = http.StatusBadRequest
 		}
 		c.JSON(status, models.Response{Success: false, Error: err.Error()})
 		return
@@ -1046,6 +1058,10 @@ func (h *Handler) ExportPSD(c *gin.Context) {
 	}
 	result, err := h.pythonBridge.CreatePSDPlan(req.ImagePath)
 	if err != nil {
+		if errors.Is(err, services.ErrPathOutsideBase) {
+			c.JSON(http.StatusBadRequest, models.Response{Success: false, Error: err.Error()})
+			return
+		}
 		// Fail-open: return a structured error rather than crashing.
 		c.JSON(http.StatusInternalServerError, models.Response{Success: false, Error: "PSD导出失败: " + err.Error()})
 		return
