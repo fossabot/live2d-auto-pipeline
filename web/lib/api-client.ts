@@ -303,6 +303,7 @@ export class APIClient {
   async generateStream(
     req: GenerationRequest,
     onProgress: (step: GenerationStep) => void,
+    externalSignal?: AbortSignal,
   ): Promise<GenerationResult> {
     // v0.10.1: POST /api/generate/character 是同步接口；进度来自后端在生成
     // 期间向 /api/ws 广播的 {type:"progress"} 消息（此前该通道无人订阅，
@@ -311,6 +312,17 @@ export class APIClient {
     const payload = this.buildGenerationPayload(req);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10 * 60_000);
+    // M10：外部 signal（页面「停止」按钮）必须真正联动中断 HTTP 请求。
+    // 此前调用方的 AbortController.abort() 只改了本地 UI 状态，fetch 不带
+    // signal，后端任务照跑、请求照等 —— 是假取消。
+    const onExternalAbort = () => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort();
+      } else {
+        externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+      }
+    }
 
     let ws: WebSocket | null = null;
     try {
@@ -350,6 +362,7 @@ export class APIClient {
       return this.mapGenerationResult(result);
     } finally {
       clearTimeout(timeout);
+      externalSignal?.removeEventListener('abort', onExternalAbort);
       if (ws) {
         ws.onmessage = null;
         try { ws.close(); } catch { /* ignore */ }
@@ -479,6 +492,50 @@ export class APIClient {
 
   // ---------- export ----------
 
+  /**
+   * 下载真正的 Live2D zip 包（M11）。
+   *
+   * 此前导出中心把 model3.json 的 URL 配上 .zip 文件名塞给 <a download>，
+   * 用户下到的是改名的 JSON，打开必损坏。这里走后端 download=true 的二进制
+   * 通道，校验 Content-Type 后以 Blob 落盘，并采用后端 Content-Disposition
+   * 给出的真实文件名。model_dir 指向已构建目录时，Go 后端直接打包、不重跑构建。
+   */
+  async exportModelZip(
+    characterId: string,
+    opts: { layersDir?: string; modelDir?: string } = {},
+  ): Promise<{ blob: Blob; filename: string }> {
+    const payload: Record<string, unknown> = {
+      character_id: characterId,
+      format: 'live2d-package',
+      download: true,
+    };
+    if (opts.modelDir) payload.model_dir = opts.modelDir;
+    if (opts.layersDir) payload.layers_dir = opts.layersDir;
+
+    const res = await fetch(`${this.baseURL}/api/export/live2d`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      let msg = `Export failed: ${res.status} ${res.statusText}`;
+      try {
+        const errData = await res.json();
+        if (errData.error) msg = errData.error;
+      } catch { /* 非 JSON 错误体时保留状态行 */ }
+      throw new APIError(msg, res.status);
+    }
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('zip')) {
+      throw new Error('导出响应不是 zip 二进制包');
+    }
+    let filename = 'live2d_model.zip';
+    const match = /filename="?([^"]+)"?/.exec(res.headers.get('content-disposition') || '');
+    if (match?.[1]) filename = match[1];
+    const blob = await res.blob();
+    return { blob, filename };
+  }
+
   async exportModel(
     characterId: string,
     format: ExportFormat,
@@ -487,6 +544,7 @@ export class APIClient {
     model3_json?: string;
     texture?: string;
     model_path?: string;
+    output_dir?: string;
     success: boolean;
     /** 该模型包能否被 Live2D 运行时直接加载（构建期官方 Cubism Core 验收通过才为 true）。 */
     runtime_ready?: boolean;

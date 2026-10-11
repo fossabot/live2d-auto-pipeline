@@ -27,7 +27,7 @@ import {
   type ExportedModelInfo,
   type LatestGeneration,
 } from '../lib/api-client';
-import { loadFaceLandmarker, resultToLive2DParams } from '../lib/face-tracker';
+import { loadFaceLandmarker, closeFaceLandmarker, resultToLive2DParams } from '../lib/face-tracker';
 import type { FaceLandmarker } from '@mediapipe/tasks-vision';
 import type { Live2DPlayer } from '../lib/live2d-player';
 
@@ -72,10 +72,16 @@ const PreviewPage: NextPage = () => {
   const [petMsg, setPetMsg] = useState<string | null>(null);
   const [models, setModels] = useState<ExportedModelInfo[]>([]);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  /** 麦克风独立音频流：与摄像头视频流分开持有，关闭麦克风时必须显式停轨，
+      否则系统麦克风指示灯会一直亮（AudioContext.close 不会释放设备）。 */
+  const audioStreamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const animRef = useRef<number | null>(null);
   const trackRafRef = useRef<number | null>(null);
   const landmarkerRef = useRef<FaceLandmarker | null>(null);
+  /** 启停会话令牌：加载模型/摄像头是异步的，途中用户点了停止时，
+      恢复执行的启动流程必须靠它识别「自己已过期」并退出。 */
+  const trackingSessionRef = useRef(0);
   const lastVideoTimeRef = useRef(-1);
   const lastReadoutRef = useRef(0);
   const [error, setError] = useState<string | null>(null);
@@ -163,12 +169,22 @@ const PreviewPage: NextPage = () => {
   const startBrowserTracking = useCallback(async () => {
     const video = videoRef.current;
     if (!video) throw new Error('视频元素未就绪');
+    const session = ++trackingSessionRef.current;
     const landmarker = await loadFaceLandmarker();
+    // 加载期间用户已停止：stop 侧会负责关闭这个实例，这里直接退出，
+    // 绝不能再把它挂回 ref 或继续申请摄像头。
+    if (trackingSessionRef.current !== session) {
+      throw new Error('面捕已取消');
+    }
     landmarkerRef.current = landmarker;
 
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { width: 640, height: 480, facingMode: 'user' },
     });
+    if (trackingSessionRef.current !== session) {
+      stream.getTracks().forEach((t) => t.stop());
+      throw new Error('面捕已取消');
+    }
     mediaStreamRef.current = stream;
     video.srcObject = stream;
     await video.play().catch(() => undefined);
@@ -201,12 +217,12 @@ const PreviewPage: NextPage = () => {
       cancelAnimationFrame(trackRafRef.current);
       trackRafRef.current = null;
     }
-    // FaceLandmarker.close() 是同步的，且实例可能已释放
-    try {
-      landmarkerRef.current?.close();
-    } catch { /* 已释放 */ }
+    // 经统一出口释放：关闭实例的同时清空模块缓存（M8），否则下次启动会拿到
+    // 已 close 的 landmarker。该函数同步清空缓存、异步关实例，void 调用即可。
+    trackingSessionRef.current = 0;
     landmarkerRef.current = null;
     lastVideoTimeRef.current = -1;
+    void closeFaceLandmarker();
   }, []);
 
   // FPS loop
@@ -303,6 +319,8 @@ const PreviewPage: NextPage = () => {
       mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
       mediaStreamRef.current = null;
       setWebcamOn(false);
+      // 加载途中用户主动停止（会话令牌已被 stop 清零）：不是错误，不弹提示
+      if (trackingSessionRef.current === 0) return;
       setError(e instanceof Error ? e.message : '面捕启动失败');
     }
   }, [webcamOn, startBrowserTracking, stopBrowserTracking]);
@@ -311,14 +329,19 @@ const PreviewPage: NextPage = () => {
     if (micOn) {
       audioCtxRef.current?.close().catch(() => undefined);
       audioCtxRef.current = null;
+      // 只关 AudioContext 不会释放麦克风：必须显式停掉音频轨，
+      // 否则浏览器/系统的麦克风指示灯一直亮。
+      audioStreamRef.current?.getTracks().forEach((t) => t.stop());
+      audioStreamRef.current = null;
       setMicOn(false);
       return;
     }
+    let stream: MediaStream;
     try {
-      const stream =
-        mediaStreamRef.current ||
-        (await navigator.mediaDevices.getUserMedia({ audio: true }));
-      if (!mediaStreamRef.current) mediaStreamRef.current = stream;
+      // 始终申请独立音频流：摄像头流只请求了 video，复用它做音源会拿到
+      // 静默轨道（嘴型永远不动）。独立持有也方便单独释放麦克风设备。
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioStreamRef.current = stream;
       const ctx = new AudioContext();
       const source = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
@@ -338,14 +361,21 @@ const PreviewPage: NextPage = () => {
         requestAnimationFrame(readMouth);
       };
       readMouth();
-    } catch {
+    } catch (e) {
+      // 授权失败/无设备：释放已拿到的任何资源，避免泄漏半开状态
+      audioStreamRef.current?.getTracks().forEach((t) => t.stop());
+      audioStreamRef.current = null;
+      audioCtxRef.current?.close().catch(() => undefined);
+      audioCtxRef.current = null;
       setMicOn(false);
+      setError(e instanceof Error ? e.message : '麦克风启动失败');
     }
   }, [micOn]);
 
   useEffect(() => {
     return () => {
       mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+      audioStreamRef.current?.getTracks().forEach((t) => t.stop());
       audioCtxRef.current?.close().catch(() => undefined);
       if (animRef.current) cancelAnimationFrame(animRef.current);
       stopBrowserTracking();

@@ -161,6 +161,8 @@ const GeneratePage: NextPage = () => {
       // simulate steps if API not available, but try real API first
       let gotResult: GenerationResult | null = null;
       try {
+        // M10：把页面「停止」按钮的 AbortSignal 真正传下去，
+        // fetch 会随 abort 中断，后端在 H4 后也会收掉整个 Python 任务。
         gotResult = await apiClient.generateStream(req, (step) => {
           setSteps((prev) =>
             prev.map((s) =>
@@ -169,8 +171,15 @@ const GeneratePage: NextPage = () => {
                 : s,
             ),
           );
-        });
+        }, abortRef.current?.signal);
       } catch (err) {
+        // 用户主动取消：不是失败，把进行中的步骤退回待办，不弹错误。
+        if (abortRef.current?.signal.aborted || (err as { name?: string })?.name === 'AbortError') {
+          setSteps((prev) =>
+            prev.map((s) => (s.status === 'active' ? { ...s, status: 'pending' as const } : s)),
+          );
+          return;
+        }
         // Do not fabricate a successful result when the backend fails. A demo
         // image hides configuration and provider errors from the user.
         throw err;

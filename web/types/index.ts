@@ -451,6 +451,16 @@ export interface ExportDownload {
   filename: string;
   size: number;
   url: string;
+  /**
+   * M11：存在该字段时表示「真正的 zip 包」——点击后需调后端 download=true
+   * 拉二进制（modelDir 指向已构建目录，Go 端直接打包不重跑），而不是把
+   * model3.json 改名成 .zip 下载（旧实现下到的是损坏的假 zip）。
+   */
+  modelDir?: string;
+  /** 与该条目配对的角色 ID，请求 zip 时使用。 */
+  characterId?: string;
+  /** zip 拉取前体积未知，UI 应显示占位而非 0 B。 */
+  sizePending?: boolean;
 }
 
 // ---------- System ----------

@@ -172,7 +172,19 @@ const ExportPage: NextPage = () => {
             if (!payload) {
               throw new Error(`Export returned no file for ${format}`);
             }
-            downloads.push({ format, filename, size: payload.length, url: payload });
+            // M11：条目标记为「真实 zip」——output_dir 是已构建的模型目录，
+            // 点击时由 downloadFile 调 download=true 打包目录（Go 端不再重跑
+            // 构建）。绝不能把 model3.json 的 URL 配 .zip 名直接下载。
+            const modelDir = result.output_dir || '';
+            downloads.push({
+              format,
+              filename,
+              size: 0,
+              sizePending: !!modelDir,
+              url: modelDir ? '' : payload,
+              modelDir: modelDir || undefined,
+              characterId: selectedId,
+            });
             // 如实反映「能否直接运行」：缺 .moc3 时给出明确阻塞原因
             if (result.runtime_ready === false && result.blocker) {
               setBlocker(result.blocker);
@@ -206,9 +218,35 @@ const ExportPage: NextPage = () => {
     setHistory((prev) => [completed, ...prev].slice(0, 10));
   }, [selectedId, formats, characters, layersDir]);
 
-  const downloadFile = (dl: ExportDownload) => {
+  const [packingFormat, setPackingFormat] = useState<string | null>(null);
+
+  const downloadFile = async (dl: ExportDownload) => {
     if (dl.url.startsWith('#')) {
       alert(`Demo download: ${dl.filename} (connect API to generate real file)`);
+      return;
+    }
+    // M11：真实 zip 走后端二进制通道现打包，落盘的是可正常解压的包
+    if (dl.modelDir) {
+      if (packingFormat) return; // 同时只打一个包
+      setPackingFormat(dl.format);
+      let objectUrl = '';
+      try {
+        const { blob, filename } = await apiClient.exportModelZip(dl.characterId || selectedId || '', {
+          modelDir: dl.modelDir,
+        });
+        objectUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objectUrl;
+        a.download = filename;
+        a.click();
+        // 下载已由浏览器接管，稍后回收对象 URL 释放内存
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+      } catch (e) {
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        setError(e instanceof Error ? e.message : 'zip 打包下载失败');
+      } finally {
+        setPackingFormat(null);
+      }
       return;
     }
     const a = document.createElement('a');
@@ -417,24 +455,36 @@ const ExportPage: NextPage = () => {
               {job.downloads && job.downloads.length > 0 && (
                 <div className="mt-4 space-y-2">
                   <p className="text-xs text-gray-400 mb-2">Downloads</p>
-                  {job.downloads.map((dl) => (
+                  {job.downloads.map((dl) => {
+                    const isPacking = packingFormat === dl.format;
+                    return (
                     <button
                       key={dl.format}
-                      onClick={() => downloadFile(dl)}
-                      className="w-full flex items-center justify-between p-3 rounded-lg bg-gray-900 border border-gray-800 hover:border-pink-500/40 hover:bg-pink-500/5 transition-colors group"
+                      onClick={() => void downloadFile(dl)}
+                      disabled={isPacking}
+                      className="w-full flex items-center justify-between p-3 rounded-lg bg-gray-900 border border-gray-800 hover:border-pink-500/40 hover:bg-pink-500/5 transition-colors group disabled:opacity-60 disabled:cursor-wait"
                     >
                       <div className="flex items-center gap-2 min-w-0">
-                        <FileArchive className="w-4 h-4 text-pink-400 shrink-0" />
-                        <span className="text-xs text-white truncate">{dl.filename}</span>
+                        {isPacking ? (
+                          <Loader2 className="w-4 h-4 text-pink-400 shrink-0 animate-spin" />
+                        ) : (
+                          <FileArchive className="w-4 h-4 text-pink-400 shrink-0" />
+                        )}
+                        <span className="text-xs text-white truncate">
+                          {isPacking ? '正在打包 zip…' : dl.filename}
+                        </span>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
                         <span className="text-[10px] text-gray-500 font-mono">
-                          {formatSize(dl.size)}
+                          {dl.sizePending ? '点击下载' : formatSize(dl.size)}
                         </span>
-                        <Download className="w-3.5 h-3.5 text-gray-500 group-hover:text-pink-400 transition-colors" />
+                        {!isPacking && (
+                          <Download className="w-3.5 h-3.5 text-gray-500 group-hover:text-pink-400 transition-colors" />
+                        )}
                       </div>
                     </button>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -490,10 +540,11 @@ const ExportPage: NextPage = () => {
                         {h.downloads.map((dl) => (
                           <button
                             key={dl.format}
-                            onClick={() => downloadFile(dl)}
-                            className="text-[10px] px-2 py-0.5 rounded bg-gray-800 text-gray-300 hover:text-pink-400 hover:bg-gray-700 transition-colors"
+                            onClick={() => void downloadFile(dl)}
+                            disabled={packingFormat === dl.format}
+                            className="text-[10px] px-2 py-0.5 rounded bg-gray-800 text-gray-300 hover:text-pink-400 hover:bg-gray-700 transition-colors disabled:opacity-60 disabled:cursor-wait"
                           >
-                            {dl.format}
+                            {packingFormat === dl.format ? '打包中…' : dl.format}
                           </button>
                         ))}
                       </div>

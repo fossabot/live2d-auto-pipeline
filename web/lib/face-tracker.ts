@@ -71,11 +71,32 @@ export function loadFaceLandmarker(): Promise<FaceLandmarker> {
   return landmarkerPromise;
 }
 
+/**
+ * 释放缓存的 FaceLandmarker 实例并清空单例（M8）。
+ *
+ * 不清理的后果：stopBrowserTracking() 调过 close() 后，模块级
+ * landmarkerPromise 仍解析到**已关闭**实例，下次启动面捕时
+ * loadFaceLandmarker() 直接把它返回，detectForVideo 必然抛错——
+ * 表现为「停止面捕后再也无法重新启动」。加载途中调用也安全：先摘掉
+ * 缓存，等实例就绪再 close，期间的加载失败由内部 catch 处理。
+ */
+export async function closeFaceLandmarker(): Promise<void> {
+  const pending = landmarkerPromise;
+  landmarkerPromise = null;
+  if (!pending) return;
+  try {
+    (await pending).close();
+  } catch {
+    /* 已释放或加载失败：缓存已清空，下次 loadFaceLandmarker 会重建 */
+  }
+}
+
 interface BlendshapeCategory {
   categoryName?: string;
   displayName?: string;
   score?: number;
 }
+
 
 function bs(map: Map<string, number>, name: string): number {
   return map.get(name) ?? 0;
