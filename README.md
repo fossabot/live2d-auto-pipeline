@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mw2wbyys6t-sudo/live2d-auto-pipeline/releases"><img src="https://img.shields.io/badge/version-0.10.3-ff69b4?style=flat-square" alt="version"></a>
+  <a href="https://github.com/mw2wbyys6t-sudo/live2d-auto-pipeline/releases"><img src="https://img.shields.io/badge/version-0.10.5-ff69b4?style=flat-square" alt="version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green?style=flat-square" alt="license"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.9+-blue?style=flat-square" alt="python"></a>
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat-square" alt="go"></a>
@@ -21,7 +21,7 @@
 
 ## 先说清楚：现在能干什么
 
-我不想给你画饼。这个项目有些部分已经很稳，有些还在路上。下面是**截至 v0.10.3 的真实状态**：
+我不想给你画饼。这个项目有些部分已经很稳，有些还在路上。下面是**截至 v0.10.5 的真实状态**：
 
 | 能力 | 状态 | 说明 |
 |------|------|------|
@@ -67,7 +67,7 @@
 
 - **要商业级、能直接上镜直播的成品模型** —— 自动绑定给不了那个精度，仍需专业 Live2D 技术师手动精修
 - **想照着已有角色或某张立绘复刻** —— 这个项目是从文字描述生成**新**角色，不是照图转模型
-- **完全不想碰命令行和环境配置** —— 目前仍要装 Python / Node，没有一键安装包
+- **完全不想碰命令行和环境配置** —— 桌面应用双击即可运行（需另装 Python 才能用 AI 生图），核心 UI 和离线占位图开箱即用
 
 ### 典型使用场景
 
@@ -88,7 +88,28 @@
 
 ## 快速开始
 
-### 最快的方式（30 秒体验核心能力）
+### 🖥️ 桌面应用（推荐 — 直接利用本地 GPU/CPU）
+
+> **v0.10.5 起全面转向桌面应用**。Docker 和独立 Web 部署已废弃，桌面应用成为唯一分发形态。
+
+**下载安装包**（零配置，双击即用）：
+
+👉 [最新 Release v0.10.5](https://github.com/mw2wbyys6t-sudo/live2d-auto-pipeline/releases/tag/v0.10.5)
+
+| 下载文件 | 大小 | 说明 |
+|----------|------|------|
+| `Live2DMasterAgent.exe` | ~22 MB | **正式版** — GUI 模式，双击运行，无控制台窗口 |
+| `Live2DMasterAgent-console.exe` | ~32 MB | **调试版** — 带控制台日志，排查问题用 |
+| `Live2DMasterAgent-v0.10.5-portable.zip` | ~24 MB | **便携包** — 两个 exe + 中文说明文档 |
+
+**使用方式**：
+1. 下载 `Live2DMasterAgent.exe`，放到任意目录
+2. 双击运行，浏览器自动打开 `http://localhost:8080`
+3. 看到 8 页面工作台，核心 UI 和离线占位图开箱即用
+
+> 💡 AI 高质量生图需另装 Python 3.11+（`pip install -r requirements.txt`），将 exe 放在项目根目录即可自动发现 Python 工程。离线占位图兜底完全免费，无需任何配置。
+
+### 命令行快速体验（30 秒核心能力）
 
 ```bash
 # 安装依赖
@@ -103,18 +124,19 @@ python -m core.cli
 
 就这么简单。如果你的网络能访问 pollinations.ai，几十秒内你就能在 `output/` 目录看到生成的角色立绘。
 
-### 桌面应用（推荐 — 直接利用本地 GPU/CPU）
+### 从源码构建桌面应用
 
 ```bash
-# Windows：双击运行
-# 首次：双击 install.bat 安装
-# 之后：双击 start.bat 启动
+# 前置：Node.js + npm + Go 1.21+
+# 一键构建（Windows 交叉编译，Linux/macOS 也可运行）
+./scripts/build_desktop.sh
 
-# 或从 Release 页面下载安装包：
-# https://github.com/mw2wbyys6t-sudo/live2d-auto-pipeline/releases
+# 产物：
+#   dist/Live2DMasterAgent.exe         桌面版（无控制台，双击运行）
+#   dist/Live2DMasterAgent-console.exe 调试版（带控制台日志）
 ```
 
-桌面应用将前端 UI 内嵌进单个 Go 二进制，同源服务、无需额外端口，直接调用本机 GPU/CPU 进行 AI 推理。
+构建流程：Next.js 静态导出 → 版本化资源 URL → 复制到 `api/webui/dist/` → Go 交叉编译（内嵌前端）
 
 ### 开发模式（前后端分离调试）
 
@@ -266,7 +288,9 @@ cd web && npm run build
 
 | 版本 | 日期 | 重点 |
 |------|------|------|
-| **v0.10.3** | 2026-10-08 | 沙箱就绪：离线兜底生图 + PSD 缺依赖不崩 + 健康检查真实化 + 端口冲突友好提示 |
+| **v0.10.5** | 2026-10-11 | **Desktop First**：移除 Docker/Web 部署，全面转向桌面应用；桌面应用安装包可直接下载 |
+| **v0.10.4** | 2026-10-11 | **Hardened Shell**：5 项安全加固（CSP/面捕恢复、zip symlink 防护、目录列举禁用、SSRF DNS 钉扎、PNG 批量导入内存优化） |
+| v0.10.3 | 2026-10-08 | 沙箱就绪：离线兜底生图 + PSD 缺依赖不崩 + 健康检查真实化 + 端口冲突友好提示 |
 | v0.10.2 | 2026-09-29 | 离线兜底生成器 + PSD 图层命名 + 桌面打包工具链 |
 | v0.10.1 | 2026-09-22 | 自研 moc3 编译器：官方 Cubism 参数驱动 + 逐像素验收通过 |
 | v0.10.0 | 2026-09-22 | SAM 语义分层 + 完整 Cubism4 模型包 + MediaPipe 面捕 + LLM 对话 |
@@ -285,7 +309,7 @@ cd web && npm run build
 | [已知局限](docs/LIMITATIONS.md) | 功能边界 |
 | [架构设计](docs/ARCHITECTURE.md) | 技术架构详解 |
 | [架构决策](docs/architecture/index.md) | 6 条核心 ADR + 架构不变量 |
-| [部署指南](docs/DEPLOY.md) | 云端/本地部署 |
+| [部署指南](docs/DEPLOY.md) | 桌面应用安装与构建 |
 
 ---
 
