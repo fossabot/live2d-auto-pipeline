@@ -4,6 +4,72 @@
 
 ---
 
+## [v0.10.4] — 2026-10-11 — 代号「Hardened Shell」
+
+> **本版目标**：系统性安全加固——堵住 5 类审计发现的安全缺陷，覆盖前端面捕、文件导出、静态产物服务、SSRF 防护和批量导入内存安全。
+
+### 🔴 安全修复（SECURITY）
+
+#### S1. 桌面端面捕恢复 — CSP 放行 MediaPipe + Permissions-Policy 允许 camera（审计 A）
+- **问题**：CSP `connect-src` 缺少 MediaPipe CDN 回退源（`cdn.jsdelivr.net` / `storage.googleapis.com`），导致桌面端摄像头面捕在 CDN 回退路径下被浏览器阻断；Permissions-Policy 设为 `camera=()` 直接全局禁用摄像头 API。
+- **修复**：
+  - [api/main.go](api/main.go) 提取命名安全头中间件 `securityHeadersMiddleware()`，CSP `connect-src` 放行 `cdn.jsdelivr.net` + `storage.googleapis.com`，`media-src` 增加 `blob:`
+  - Permissions-Policy 从 `camera=()` 修正为 `camera=(self)`
+  - [web/public/_headers](web/public/_headers) 同步更新，覆盖非嵌入式部署场景
+- **测试**：[api/p4_csp_permissions_test.go](api/p4_csp_permissions_test.go) 验证 CSP 包含所需源、Permissions-Policy 允许 `self` 摄像头
+
+#### S2. zip 导出不再跟随符号链接 — 修复 symlink 泄露 + fd 累积（审计 C）
+- **问题**：`export_zip.go` 使用 `os.Open` 跟随符号链接，攻击者可在打包目录中放置指向敏感文件的 symlink 导致越权读取；`defer f.Close()` 在 `filepath.Walk` 回调中累积文件描述符，大批量打包时可能耗尽 fd。
+- **修复**：
+  - 增加 `!info.Mode().IsRegular()` 检查，跳过 symlink / 设备 / 管道等非普通文件
+  - 将 `defer f.Close()` 替换为 `io.Copy` 后显式关闭，消除 fd 累积
+  - 增加 `io.Copy` 字节数与 `info.Size()` 一致性校验
+- **测试**：[api/handlers/p4_zip_symlink_test.go](api/handlers/p4_zip_symlink_test.go) 构造指向外部秘密文件的 symlink，验证产物不含 symlink 及泄露内容
+
+#### S3. /output/ 目录列举禁用（审计 D）
+- **问题**：`ServeOutput` 直接调用 `http.ServeFile`，当请求路径指向目录时返回 HTML 目录列举，泄露所有生成产物文件名。
+- **修复**：[api/handlers/handlers.go](api/handlers/handlers.go) ServeOutput 增加 `info.IsDir()` 检查，目录请求统一返回 404 JSON。
+- **测试**：[api/handlers/p4_output_dir_test.go](api/handlers/p4_output_dir_test.go) 验证目录请求返回非 200、普通文件仍正常下载
+
+#### S4. SSRF DNS Rebinding TOCTOU 收口（审计 B）
+- **问题**：图片下载链路虽然做了 URL 校验（协议、IP 黑白名单），但校验与实际 HTTP 请求之间存在 TOCTOU（Time-of-Check-Time-of-Use）窗口：攻击者可在校验通过后、请求发起前通过 DNS rebinding 将域名解析切换到内网 IP。
+- **修复**：
+  - [core/image_gen/base.py](core/image_gen/base.py) 引入 threading-local DNS 钉扎机制
+  - `CheckedURL` 校验时缓存 `addr_infos`，`checked_image_download` 下载时通过 `DNSPin` 上下文管理器锁定解析结果，确保下载阶段使用的 IP 与校验阶段完全一致
+- **测试**：[tests/unit/test_checked_download.py](tests/unit/test_checked_download.py) 新增 5 个 DNS 钉扎回归用例（21/21 通过）
+
+#### S5. PNG 批量导入内存放大修复 — 两遍扫描（审计 E）
+- **问题**：批量导入时一次性对所有上传文件执行 `image.Decode`（完整像素解码），200 张 4K PNG 会同时占用约 10GB 内存。
+- **修复**：
+  - [api/services/imaging.go](api/services/imaging.go) 提取 `checkImageConfig` 函数，封装 header-only 尺寸校验逻辑
+  - [api/services/upload_service.go](api/services/upload_service.go) 改为两遍策略：
+    - **Pass 1**：逐文件 `checkImageConfig`（仅读 header）→ 收集最大画布尺寸 + 元数据
+    - **Pass 2**：逐文件 `Decode` → `NormalizeToCanvas` → 写入 → 立即释放
+  - 峰值内存从「N 张同时解码」降至「1 张解码 + N 个 header」
+- **测试**：[api/services/p4_png_twopass_test.go](api/services/p4_png_twopass_test.go) 导入 3 张不同尺寸 PNG，验证全部归一化到最大画布
+
+### 🔵 工程改进
+
+- **安全头集中管理**：Go 后端安全头从匿名中间件提取为命名函数 `securityHeadersMiddleware()`，便于测试和维护
+- **TDD 覆盖**：全部 5 项修复均通过红绿流程交付，回归测试覆盖 symlink 泄露、DNS rebinding、目录列举、CSP 头、内存安全等场景
+
+### 验证状态
+
+| 检查项 | 结果 |
+|--------|------|
+| `go build ./...` | ✅ 通过 |
+| `go test -race -count=1 ./...` | ✅ 全包通过 |
+| `go vet ./...` | ✅ 无告警 |
+| `pytest test_checked_download.py` | ✅ 21/21 |
+| `npx tsc --noEmit` | ✅ 仅预存 preview.tsx 噪音 |
+
+### 已知限制
+
+- CSP 仍保留 `'unsafe-inline'` 和 `'unsafe-eval'`——前者用于内联样式，后者用于前端动态加载。后续版本可通过 nonce 收紧。
+- DNS 钉扎仅覆盖 `checked_image_download` 路径；若新增其他出站 HTTP 调用，需同样接入 `DNSPin`。
+
+---
+
 ## [v0.10.3] — 2026-10-08 — 代号「Sandbox-Ready」
 
 > **本版目标**：解决阻碍「下载双击就能在本地沙箱跑通完整生成流程」的最致命问题，为本地开发与首次运行做好万全准备。
